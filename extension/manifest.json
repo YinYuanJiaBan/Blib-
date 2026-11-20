@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Переводчик сайтов: китайский → русский",
+  "version": "1.0.0",
+  "description": "Переводит китайские веб-страницы на русский прямо на месте, включая динамически подгружаемый контент.",
+  "permissions": ["storage", "activeTab", "contextMenus"],
+  "host_permissions": ["https://translate.googleapis.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Перевести страницу на русский"
+  },
+  "commands": {
+    "toggle-translation": {
+      "suggested_key": { "default": "Alt+T" },
+      "description": "Перевести страницу / показать оригинал"
+    }
+  }
+}
