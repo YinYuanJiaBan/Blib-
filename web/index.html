@@ -8,11 +8,13 @@
   :root {
     --bg: #f6f5f2; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
     --line: #e3e1dc; --accent: #b4442c; --accent-text: #fff; --ok: #2e7d4f; --on-ok: #fff; --err: #b3261e;
+    --seg: #ebe9e4;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #161616; --card: #1f1f1f; --text: #f2f2f2; --muted: #a1a1a6;
       --line: #333; --accent: #e0694f; --accent-text: #111; --ok: #6fcf97; --on-ok: #0d2a1a; --err: #ff8a80;
+      --seg: #2a2a2a;
     }
   }
   * { box-sizing: border-box; }
@@ -20,20 +22,31 @@
     font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
   h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -.01em; }
-  .sub { color: var(--muted); margin: 0 0 24px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 14px; }
   label { display: block; font-weight: 600; margin-bottom: 8px; }
-  input[type=url], input[type=number] { width: 100%; font: inherit; padding: 12px 14px; border-radius: 10px;
+  input[type=url], input[type=number], input[type=password], input[type=text], textarea {
+    width: 100%; font: inherit; padding: 12px 14px; border-radius: 10px;
     border: 1px solid var(--line); background: var(--bg); color: var(--text); }
-  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  textarea { min-height: 80px; resize: vertical; font-size: 15px; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
   .row { display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
   .row label { margin: 0; font-weight: 400; color: var(--muted); }
   .row input[type=number] { width: 110px; padding: 8px 10px; }
+  .check { display: flex; gap: 10px; align-items: flex-start; font-weight: 400; margin: 0; cursor: pointer; }
+  .check input { width: 20px; height: 20px; margin: 2px 0 0; accent-color: var(--accent); flex: none; }
+  .field { margin-top: 14px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .seg { display: flex; background: var(--seg); border-radius: 10px; padding: 3px; margin-bottom: 16px; }
+  .seg button { margin: 0; flex: 1; background: transparent; color: var(--text); font-weight: 500; padding: 9px; }
+  .seg button[aria-pressed=true] { background: var(--card); box-shadow: 0 1px 3px rgba(0,0,0,.15); font-weight: 600; }
+  input[type=file] { font: inherit; width: 100%; }
   button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 13px 18px;
     background: var(--accent); color: var(--accent-text); cursor: pointer; width: 100%; margin-top: 16px; }
   button:disabled { opacity: .5; cursor: default; }
   button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
-  #status { margin-top: 20px; display: none; }
+  #status { display: none; }
   .book-title { font-size: 20px; font-weight: 700; margin: 0; }
   .book-author { color: var(--muted); margin: 2px 0 12px; }
   progress { width: 100%; height: 10px; accent-color: var(--accent); }
@@ -42,25 +55,64 @@
   .msg.ok { color: var(--ok); }
   a.download { display: block; text-align: center; text-decoration: none; margin-top: 14px; padding: 13px;
     border-radius: 10px; background: var(--ok); color: var(--on-ok); font-weight: 600; }
-  .note { color: var(--muted); font-size: 14px; margin-top: 24px; }
+  .note { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <main>
   <h1>Книга в EPUB</h1>
-  <p class="sub">Вставьте ссылку на оглавление книги на kanunu8.com, и страница соберёт её в EPUB на языке оригинала.</p>
+  <p class="sub">Соберите книгу с kanunu8.com по ссылке или загрузите готовый EPUB. При желании книгу можно перевести на русский через OpenRouter.</p>
 
-  <form class="card" id="form">
-    <label for="url">Ссылка на оглавление</label>
-    <input type="url" id="url" required placeholder="https://www.kanunu8.com/files/old/2011/2560.html" autocomplete="off">
-    <div class="row">
-      <label for="limit">Только первые глав:</label>
-      <input type="number" id="limit" min="1" placeholder="все">
-    </div>
+  <form id="form">
+    <section class="card">
+      <div class="seg" role="group" aria-label="Источник">
+        <button type="button" data-mode="link" aria-pressed="true">По ссылке</button>
+        <button type="button" data-mode="file" aria-pressed="false">Готовый EPUB</button>
+      </div>
+
+      <div id="modeLink">
+        <label for="url">Ссылка на оглавление</label>
+        <input type="url" id="url" placeholder="https://www.kanunu8.com/files/old/2011/2560.html" autocomplete="off">
+      </div>
+      <div id="modeFile" hidden>
+        <label for="file">Файл EPUB</label>
+        <input type="file" id="file" accept=".epub,application/epub+zip">
+      </div>
+      <div class="row">
+        <label for="limit">Только первые глав:</label>
+        <input type="number" id="limit" min="1" placeholder="все">
+      </div>
+    </section>
+
+    <section class="card">
+      <label class="check"><input type="checkbox" id="doTranslate"> <span><b>Перевести на русский</b> через OpenRouter</span></label>
+      <div id="trOptions" hidden>
+        <div class="field">
+          <label for="apiKey">Ключ OpenRouter</label>
+          <input type="password" id="apiKey" placeholder="sk-or-v1-…" autocomplete="off">
+          <div class="hint">Ключ хранится только в этом браузере и отправляется только на openrouter.ai.</div>
+        </div>
+        <div class="field">
+          <label for="model">Модель</label>
+          <input type="text" id="model" value="deepseek/deepseek-chat" autocomplete="off" spellcheck="false">
+          <div class="hint">По умолчанию DeepSeek. Можно указать любую модель OpenRouter, например <code>deepseek/deepseek-r1</code>.</div>
+        </div>
+        <div class="field">
+          <label for="glossary">Глоссарий имён (необязательно)</label>
+          <textarea id="glossary" placeholder="顾茫 = Гу Ман&#10;墨熄 = Мо Си"></textarea>
+          <div class="hint">По одному на строку. Помогает переводить имена и термины одинаково во всей книге.</div>
+        </div>
+        <div class="field">
+          <label class="check"><input type="checkbox" id="bilingual"> <span>Оставить китайский оригинал над каждым абзацем</span></label>
+        </div>
+      </div>
+    </section>
+
     <button type="submit" id="go">Собрать EPUB</button>
   </form>
 
-  <section class="card" id="status" aria-live="polite">
+  <section class="card" id="status" aria-live="polite" style="margin-top:14px">
     <p class="book-title" id="bookTitle"></p>
     <p class="book-author" id="bookAuthor"></p>
     <progress id="bar" value="0" max="1"></progress>
@@ -69,6 +121,7 @@
     <button type="button" class="secondary" id="cancel">Остановить</button>
   </section>
 
+  <p class="note">Пока идёт перевод, не закрывайте вкладку. Если процесс прервался, запустите его снова: уже переведённые части сохранены и повторно не оплачиваются.</p>
   <p class="note">Для книг в общественном достоянии (классика) или текстов, на которые у вас есть права.</p>
 </main>
 
@@ -76,11 +129,81 @@
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
-  const PROXY = "fetch?url=";      // относительный путь к прокси того же воркера
-  const WORKERS = 4;               // параллельных загрузок глав
+  const PROXY = "fetch?url=";          // прокси того же воркера
+  const OPENROUTER = "https://openrouter.ai/api/v1/chat/completions";
+  const FETCH_WORKERS = 4;             // параллельных загрузок глав
+  const TR_WORKERS = 3;                // параллельных запросов к модели
+  const BATCH_CHARS = 1800;            // китайских символов в одном запросе
+  const BATCH_ITEMS = 40;
+  const HAN = /[㐀-䶿一-鿿豈-﫿]/;
   let abort = null;
+  let mode = "link";
 
-  // ---------- загрузка и декодирование ----------
+  // ---------- настройки (localStorage, только для удобства) ----------
+  const store = {
+    get(k, d = "") { try { return localStorage.getItem("b2e." + k) ?? d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem("b2e." + k, v); } catch {} }
+  };
+  $("apiKey").value = store.get("key");
+  $("model").value = store.get("model", "deepseek/deepseek-chat");
+  $("glossary").value = store.get("glossary");
+  $("doTranslate").checked = store.get("translate") === "1";
+  $("bilingual").checked = store.get("bilingual") === "1";
+  for (const [id, k] of [["apiKey", "key"], ["model", "model"], ["glossary", "glossary"]])
+    $(id).addEventListener("change", () => store.set(k, $(id).value.trim()));
+  for (const [id, k] of [["doTranslate", "translate"], ["bilingual", "bilingual"]])
+    $(id).addEventListener("change", () => store.set(k, $(id).checked ? "1" : "0"));
+
+  function syncUi() {
+    $("trOptions").hidden = !$("doTranslate").checked;
+    $("modeLink").hidden = mode !== "link";
+    $("modeFile").hidden = mode !== "file";
+    document.querySelectorAll(".seg button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.mode === mode));
+    $("go").textContent = $("doTranslate").checked
+      ? (mode === "file" ? "Перевести EPUB" : "Собрать и перевести")
+      : "Собрать EPUB";
+  }
+  document.querySelectorAll(".seg button").forEach((b) => b.onclick = () => { mode = b.dataset.mode; syncUi(); });
+  $("doTranslate").addEventListener("change", syncUi);
+  syncUi();
+
+  // ---------- кэш переводов (IndexedDB) ----------
+  const idb = (() => {
+    let dbp = null;
+    function open() {
+      if (!dbp) dbp = new Promise((res) => {
+        try {
+          const r = indexedDB.open("book2epub", 1);
+          r.onupgradeneeded = () => r.result.createObjectStore("tr");
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => res(null);
+        } catch { res(null); }
+      });
+      return dbp;
+    }
+    return {
+      async get(k) {
+        const db = await open(); if (!db) return undefined;
+        return new Promise((res) => {
+          try { const q = db.transaction("tr").objectStore("tr").get(k); q.onsuccess = () => res(q.result); q.onerror = () => res(undefined); }
+          catch { res(undefined); }
+        });
+      },
+      async set(k, v) {
+        const db = await open(); if (!db) return;
+        try { db.transaction("tr", "readwrite").objectStore("tr").put(v, k); } catch {}
+      }
+    };
+  })();
+
+  async function sha(s) {
+    try {
+      const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+      return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    } catch { return s.length + ":" + s.slice(0, 200); }
+  }
+
+  // ---------- загрузка с сайта ----------
   async function getPage(url, signal) {
     let last;
     for (let i = 0; i < 4; i++) {
@@ -95,29 +218,32 @@
       } catch (e) {
         if (signal.aborted) throw e;
         last = e;
-        await new Promise((res) => setTimeout(res, 1200 * (i + 1)));
+        await sleep(1200 * (i + 1), signal);
       }
     }
     throw last;
   }
 
+  function sleep(ms, signal) {
+    return new Promise((res, rej) => {
+      const t = setTimeout(res, ms);
+      signal?.addEventListener("abort", () => { clearTimeout(t); rej(new DOMException("Aborted", "AbortError")); }, { once: true });
+    });
+  }
+
   const clean = (s) => (s || "").replace(/ /g, " ").trim();
 
-  // ---------- разбор оглавления ----------
   function parseIndex(url, html) {
     const doc = new DOMParser().parseFromString(html, "text/html");
     const pageTitle = clean(doc.title);
-    let title = clean(doc.querySelector("h1")?.textContent) || clean(doc.querySelector("h2")?.textContent)
+    const title = clean(doc.querySelector("h1")?.textContent) || clean(doc.querySelector("h2")?.textContent)
       || pageTitle.split(/\s*[-_]\s*|\s+by\s+/)[0];
-
     let author = "";
     const m1 = html.match(/作者[：:]\s*([^<\s]+)/);
     const m2 = pageTitle.match(/\bby\s+([^\s-]+)/) || pageTitle.match(/-\s*小说[^-]*-\s*([^-]+?)\s*-/);
     if (m1) author = m1[1]; else if (m2) author = m2[1];
-
     const description = clean(doc.querySelector('meta[name="description"]')?.getAttribute("content"));
 
-    // Главы: относительные ссылки «12345.html» или «2560/12345.html».
     const chapters = [], seen = new Set();
     for (const a of doc.querySelectorAll("a[href]")) {
       const href = a.getAttribute("href").trim();
@@ -131,48 +257,240 @@
     return { title, author: clean(author), description, chapters };
   }
 
-  // ---------- разбор главы: самый крупный <p> ----------
   function parseChapter(html) {
     let best = "";
     for (const m of html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) if (m[1].length > best.length) best = m[1];
     if (!best) return [];
     const box = document.createElement("div");
     box.innerHTML = best.replace(/<br\s*\/?>/gi, "\n").replace(/<(script|style)[\s\S]*?<\/\1>/gi, "");
-    return box.textContent.split("\n")
-      .map((p) => p.replace(/ /g, " ").replace(/^[\s　]+|[\s　]+$/g, ""))
-      .filter(Boolean);
+    return splitParas(box.textContent);
+  }
+
+  const splitParas = (text) => text.split("\n")
+    .map((p) => p.replace(/ /g, " ").replace(/^[\s　]+|[\s　]+$/g, ""))
+    .filter(Boolean);
+
+  async function loadFromLink(url, limit, signal) {
+    say("Читаю оглавление…");
+    const info = parseIndex(url, await getPage(url, signal));
+    const chapters = limit ? info.chapters.slice(0, limit) : info.chapters;
+    if (!chapters.length) throw new Error("Не нашла ни одной главы. Это точно ссылка на оглавление книги?");
+    showBook(info.title, info.author, chapters.length);
+    $("bar").max = chapters.length; $("bar").value = 0;
+
+    let done = 0, next = 0;
+    const failed = [];
+    async function worker() {
+      while (next < chapters.length) {
+        const ch = chapters[next++];
+        try { ch.paras = parseChapter(await getPage(ch.url, signal)); }
+        catch (err) { if (signal.aborted) throw err; ch.paras = []; failed.push(ch.title); }
+        $("bar").value = ++done;
+        say(`Загружено глав: ${done} из ${chapters.length}`);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(FETCH_WORKERS, chapters.length) }, worker));
+    return { ...info, chapters, source: url, failed };
+  }
+
+  // ---------- чтение готового EPUB ----------
+  async function loadFromEpub(file, limit) {
+    say("Открываю EPUB…");
+    const zip = await JSZip.loadAsync(file);
+    const read = (p) => zip.file(p)?.async("string");
+    const container = await read("META-INF/container.xml");
+    if (!container) throw new Error("Это не похоже на EPUB-файл.");
+    const opfPath = new DOMParser().parseFromString(container, "application/xml")
+      .querySelector("rootfile")?.getAttribute("full-path");
+    const opf = new DOMParser().parseFromString(await read(opfPath), "application/xml");
+    const base = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+    const meta = (tag) => clean(opf.getElementsByTagNameNS("*", tag)[0]?.textContent);
+
+    const manifest = {};
+    for (const it of opf.getElementsByTagNameNS("*", "item"))
+      manifest[it.getAttribute("id")] = { href: it.getAttribute("href"), props: it.getAttribute("properties") || "",
+        type: it.getAttribute("media-type") || "" };
+
+    const chapters = [];
+    let description = "";
+    for (const ref of opf.getElementsByTagNameNS("*", "itemref")) {
+      const item = manifest[ref.getAttribute("idref")];
+      if (!item || item.props.includes("nav") || !/html/.test(item.type)) continue;
+      const path = decodeURIComponent(new URL(item.href, "http://x/" + base).pathname.slice(1));
+      const src = await read(path);
+      if (!src) continue;
+      const doc = new DOMParser().parseFromString(src, "text/html");
+      doc.querySelectorAll("p.orig, p.meta, script, style").forEach((e) => e.remove());
+      const head = doc.querySelector("h1, h2, h3");
+      if (/(^|\/)title\.xhtml$/.test(item.href)) {    // титульная страница наших EPUB
+        description = [...doc.querySelectorAll("p")].map((p) => clean(p.textContent)).filter(Boolean).join("\n");
+        continue;
+      }
+      let paras = [...doc.querySelectorAll("p")].map((p) => clean(p.textContent)).filter(Boolean);
+      if (!paras.length) paras = splitParas((doc.body?.innerText || doc.body?.textContent || "").replace(head?.textContent || "", ""));
+      const title = clean(head?.textContent) || clean(doc.title) || `Глава ${chapters.length + 1}`;
+      if (!paras.length && !head) continue;
+      chapters.push({ title, paras });
+    }
+    const picked = limit ? chapters.slice(0, limit) : chapters;
+    if (!picked.length) throw new Error("В EPUB не нашлось текста.");
+    const info = { title: meta("title") || file.name.replace(/\.epub$/i, ""), author: meta("creator").replace(/^—$/, ""),
+      description: description || meta("description"), chapters: picked, source: file.name, failed: [] };
+    showBook(info.title, info.author, picked.length);
+    return info;
+  }
+
+  // ---------- перевод через OpenRouter ----------
+  function systemPrompt(bookTitle, glossary) {
+    let s = "Ты профессиональный литературный переводчик с китайского языка на русский. " +
+      "Переводи художественно, точно и естественно для русского читателя, сохраняя стиль, тон, диалоги и смысл оригинала. " +
+      "Китайские имена, фамилии и топонимы передавай по системе Палладия, кириллицей, единообразно во всём тексте. " +
+      "Не добавляй комментариев, примечаний, пояснений и транслитерации в скобках.\n" +
+      "Формат: каждый фрагмент начинается с метки вида ⟦N⟧. Верни перевод каждого фрагмента, начиная его с той же метки, " +
+      "в том же порядке. Не пропускай, не объединяй и не разбивай фрагменты. Не выводи ничего, кроме фрагментов с метками.";
+    if (bookTitle) s += `\nКнига: «${bookTitle}».`;
+    if (glossary) s += "\nОбязательный глоссарий (оригинал = перевод):\n" + glossary;
+    return s;
+  }
+
+  class FatalError extends Error {}
+
+  async function callModel(texts, ctx, signal) {
+    const body = texts.map((t, i) => `⟦${i + 1}⟧ ${t}`).join("\n\n");
+    let last;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const r = await fetch(OPENROUTER, {
+          method: "POST", signal,
+          headers: {
+            "Authorization": "Bearer " + ctx.key,
+            "Content-Type": "application/json",
+            "HTTP-Referer": location.origin,
+            "X-Title": "Book EPUB"
+          },
+          body: JSON.stringify({
+            model: ctx.model,
+            temperature: 0.3,
+            messages: [{ role: "system", content: ctx.system }, { role: "user", content: body }]
+          })
+        });
+        if (r.status === 401) throw new FatalError("OpenRouter не принял ключ. Проверьте его.");
+        if (r.status === 402) throw new FatalError("На счёте OpenRouter закончились средства.");
+        if (r.status === 400 || r.status === 404) {
+          const t = await r.text();
+          throw new FatalError("OpenRouter отклонил запрос (проверьте название модели): " + t.slice(0, 200));
+        }
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        if (data.error) throw new Error(data.error.message || "ошибка модели");
+        const out = data.choices?.[0]?.message?.content || "";
+        const parts = {};
+        const re = /⟦(\d+)⟧\s*([\s\S]*?)(?=⟦\d+⟧|$)/g;
+        let m;
+        while ((m = re.exec(out))) parts[+m[1]] = m[2].trim();
+        const res = texts.map((_, i) => parts[i + 1]);
+        if (res.every((x) => x)) return res;
+        throw new Error("модель вернула не все фрагменты");
+      } catch (e) {
+        if (e instanceof FatalError || signal.aborted) throw e;
+        last = e;
+        if (/не все фрагменты/.test(e.message) && texts.length > 1) break; // лучше разделить пакет
+        await sleep(Math.min(30000, 2000 * 2 ** attempt), signal);
+      }
+    }
+    if (texts.length > 1) {   // делим пакет пополам и пробуем по частям
+      const mid = Math.ceil(texts.length / 2);
+      return [...await callModel(texts.slice(0, mid), ctx, signal), ...await callModel(texts.slice(mid), ctx, signal)];
+    }
+    console.warn("Фрагмент не переведён:", last);
+    return [null];
+  }
+
+  async function translateBook(book, opts, signal) {
+    const ctx = { key: opts.key, model: opts.model, system: systemPrompt(book.title, opts.glossary) };
+    // Все строки книги: заголовки, описание, абзацы.
+    const slots = [];
+    const add = (get, set) => { const t = get(); if (t && HAN.test(t)) slots.push({ text: t, set }); };
+    add(() => book.title, (v) => { book.origTitle = book.title; book.title = v; });
+    add(() => book.author, (v) => { book.origAuthor = book.author; book.author = v; });
+    add(() => book.description, (v) => { book.description = v; });
+    for (const ch of book.chapters) {
+      ch.orig = [...ch.paras];
+      add(() => ch.title, (v) => { ch.origTitle = ch.title; ch.title = v; });
+      ch.paras.forEach((p, i) => add(() => p, (v) => { ch.paras[i] = v; }));
+    }
+
+    const batches = [];
+    let cur = [], size = 0;
+    for (const s of slots) {
+      if (cur.length && (size + s.text.length > BATCH_CHARS || cur.length >= BATCH_ITEMS)) { batches.push(cur); cur = []; size = 0; }
+      cur.push(s); size += s.text.length;
+    }
+    if (cur.length) batches.push(cur);
+
+    const total = slots.reduce((n, s) => n + s.text.length, 0);
+    $("bar").max = batches.length; $("bar").value = 0;
+    say(`Перевожу: ${total.toLocaleString("ru")} символов, ${batches.length} запросов…`);
+
+    let done = 0, next = 0, missed = 0;
+    const keyPrefix = await sha(ctx.model + "\n" + ctx.system);
+    async function worker() {
+      while (next < batches.length) {
+        const b = batches[next++];
+        const texts = b.map((s) => s.text);
+        const key = keyPrefix + ":" + await sha(texts.join("\u0001"));
+        let out = await idb.get(key);
+        if (!Array.isArray(out) || out.length !== texts.length) {
+          out = await callModel(texts, ctx, signal);
+          if (out.every((x) => x)) await idb.set(key, out);
+        }
+        out.forEach((v, i) => { if (v) b[i].set(v); else missed++; });
+        $("bar").value = ++done;
+        say(`Переведено: ${done} из ${batches.length} частей`);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(TR_WORKERS, batches.length) }, worker));
+    return missed;
   }
 
   // ---------- сборка EPUB ----------
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-  const xhtml = (title, body) =>
-    `<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" ` +
-    `xmlns:epub="http://www.idpf.org/2007/ops" lang="zh" xml:lang="zh">\n<head><meta charset="utf-8"/>` +
-    `<title>${esc(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>\n<body>\n${body}\n</body>\n</html>\n`;
   const CSS = "body{font-family:serif;line-height:1.7;margin:0 4%}h1{font-size:1.5em;text-align:center;margin:1.5em 0 1em}" +
     "h2{font-size:1.25em;text-align:center;margin:1em 0}p{text-indent:2em;margin:0 0 .5em;text-align:justify}" +
-    "p.meta{text-indent:0;text-align:center;font-style:italic}";
+    "p.meta{text-indent:0;text-align:center;font-style:italic}p.orig{color:#666;font-size:.92em;margin-bottom:.15em}";
 
-  async function buildEpub(book) {
+  async function buildEpub(book, lang, bilingual) {
+    const xhtml = (title, body) =>
+      `<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" ` +
+      `xmlns:epub="http://www.idpf.org/2007/ops" lang="${lang}" xml:lang="${lang}">\n<head><meta charset="utf-8"/>` +
+      `<title>${esc(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>\n<body>\n${body}\n</body>\n</html>\n`;
     const id = "urn:uuid:" + crypto.randomUUID();
     const files = [];
     files.push(["title", "title.xhtml", book.title, xhtml(book.title,
-      `<h1>${esc(book.title)}</h1>` + (book.author ? `<p class="meta">${esc(book.author)}</p>` : "") +
-      (book.description ? `<p>${esc(book.description)}</p>` : ""))]);
+      `<h1>${esc(book.title)}</h1>` +
+      (book.origTitle ? `<p class="meta">${esc(book.origTitle)}</p>` : "") +
+      (book.author ? `<p class="meta">${esc(book.author)}${book.origAuthor ? " (" + esc(book.origAuthor) + ")" : ""}</p>` : "") +
+      (book.description ? book.description.split("\n").map((p) => `<p>${esc(p)}</p>`).join("") : ""))]);
     book.chapters.forEach((ch, i) => {
       const n = "c" + String(i + 1).padStart(4, "0");
-      files.push([n, n + ".xhtml", ch.title, xhtml(ch.title,
-        `<h2>${esc(ch.title)}</h2>\n` + ch.paras.map((p) => `<p>${esc(p)}</p>`).join("\n"))]);
+      const parts = [`<h2>${esc(ch.title)}</h2>`];
+      if (bilingual && ch.origTitle) parts.push(`<p class="meta">${esc(ch.origTitle)}</p>`);
+      ch.paras.forEach((p, k) => {
+        if (bilingual && ch.orig && ch.orig[k] !== p) parts.push(`<p class="orig">${esc(ch.orig[k])}</p>`);
+        parts.push(`<p>${esc(p)}</p>`);
+      });
+      files.push([n, n + ".xhtml", ch.title, xhtml(ch.title, parts.join("\n"))]);
     });
 
+    const tocTitle = lang === "ru" ? "Содержание" : "目录";
     const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
     const opf = `<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="zh">
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="${lang}">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:identifier id="bookid">${id}</dc:identifier>
 <dc:title>${esc(book.title)}</dc:title>
 <dc:creator>${esc(book.author || "—")}</dc:creator>
-<dc:language>zh</dc:language>
+<dc:language>${lang}</dc:language>
 <dc:source>${esc(book.source)}</dc:source>
 <meta property="dcterms:modified">${now}</meta>
 </metadata>
@@ -186,7 +504,7 @@ ${files.map(([i, h]) => `<item id="${i}" href="${h}" media-type="application/xht
 ${files.map(([i]) => `<itemref idref="${i}"/>`).join("\n")}
 </spine>
 </package>`;
-    const nav = xhtml("目录", `<nav epub:type="toc" id="toc"><h1>目录</h1><ol>\n` +
+    const nav = xhtml(tocTitle, `<nav epub:type="toc" id="toc"><h1>${tocTitle}</h1><ol>\n` +
       files.map(([, h, t]) => `<li><a href="${h}">${esc(t)}</a></li>`).join("\n") + `\n</ol></nav>`);
     const ncx = `<?xml version="1.0" encoding="utf-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
@@ -213,62 +531,68 @@ ${files.map(([, h, t], k) => `<navPoint id="n${k + 1}" playOrder="${k + 1}"><nav
 
   // ---------- интерфейс ----------
   function say(text, cls = "") { $("msg").textContent = text; $("msg").className = "msg " + cls; }
+  function showBook(title, author, n) {
+    $("bookTitle").textContent = title;
+    $("bookAuthor").textContent = (author ? author + " · " : "") + "глав: " + n;
+  }
 
   $("cancel").onclick = () => abort?.abort();
 
   $("form").onsubmit = async (e) => {
     e.preventDefault();
-    const url = $("url").value.trim();
+    const translate = $("doTranslate").checked;
+    const opts = { key: $("apiKey").value.trim(), model: $("model").value.trim() || "deepseek/deepseek-chat",
+      glossary: $("glossary").value.trim(), bilingual: $("bilingual").checked };
     const limit = parseInt($("limit").value, 10) || 0;
+    const url = $("url").value.trim();
+    const file = $("file").files[0];
+
+    if (mode === "link" && !url) return $("url").focus();
+    if (mode === "file" && !file) return $("file").focus();
+    if (translate && !opts.key) { $("apiKey").focus(); return; }
+    store.set("key", opts.key); store.set("model", opts.model); store.set("glossary", opts.glossary);
+
     abort = new AbortController();
     const { signal } = abort;
+    let wakeLock = null;
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
 
     $("go").disabled = true;
     $("status").style.display = "block";
     $("cancel").style.display = "block";
     $("result").innerHTML = "";
-    $("bookTitle").textContent = "";
-    $("bookAuthor").textContent = "";
+    $("bookTitle").textContent = ""; $("bookAuthor").textContent = "";
     $("bar").value = 0;
-    say("Читаю оглавление…");
+    $("status").scrollIntoView({ behavior: "smooth", block: "start" });
 
     try {
-      const info = parseIndex(url, await getPage(url, signal));
-      const chapters = limit ? info.chapters.slice(0, limit) : info.chapters;
-      if (!chapters.length) throw new Error("Не нашла ни одной главы. Это точно ссылка на оглавление книги?");
-      $("bookTitle").textContent = info.title;
-      $("bookAuthor").textContent = (info.author ? info.author + " · " : "") + "глав: " + chapters.length;
-      $("bar").max = chapters.length;
-
-      let done = 0, next = 0;
-      const failed = [];
-      async function worker() {
-        while (next < chapters.length) {
-          const ch = chapters[next++];
-          try { ch.paras = parseChapter(await getPage(ch.url, signal)); }
-          catch (err) { if (signal.aborted) throw err; ch.paras = []; failed.push(ch.title); }
-          $("bar").value = ++done;
-          say(`Загружено глав: ${done} из ${chapters.length}`);
-        }
+      const book = mode === "link" ? await loadFromLink(url, limit, signal) : await loadFromEpub(file, limit);
+      const origName = book.title;
+      let missed = 0;
+      if (translate) {
+        missed = await translateBook(book, opts, signal);
+        showBook(book.title, book.author, book.chapters.length);
       }
-      await Promise.all(Array.from({ length: Math.min(WORKERS, chapters.length) }, worker));
-
       say("Собираю EPUB…");
-      const blob = await buildEpub({ ...info, chapters, source: url });
-      const name = info.title.replace(/[\\/:*?"<>|\s]+/g, "_") + ".epub";
+      const blob = await buildEpub(book, translate ? "ru" : "zh", translate && opts.bilingual);
+      const name = (translate ? book.title || origName : origName).replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 80) + ".epub";
       const a = document.createElement("a");
       a.className = "download";
       a.href = URL.createObjectURL(blob);
       a.download = name;
       a.textContent = `Скачать «${name}» (${(blob.size / 1024).toFixed(0)} КБ)`;
       $("result").appendChild(a);
-      say(failed.length ? `Готово, но не загрузились главы (${failed.length}): ${failed.slice(0, 5).join(", ")}…` : "Готово!",
-          failed.length ? "err" : "ok");
+
+      const problems = [];
+      if (book.failed?.length) problems.push(`не загрузились главы (${book.failed.length}): ${book.failed.slice(0, 3).join(", ")}…`);
+      if (missed) problems.push(`не переведено фрагментов: ${missed} (остались на китайском; запустите ещё раз, чтобы допереводить)`);
+      say(problems.length ? "Готово, но " + problems.join("; ") : "Готово!", problems.length ? "err" : "ok");
     } catch (err) {
-      say(signal.aborted ? "Остановлено." : "Ошибка: " + err.message, "err");
+      say(signal.aborted ? "Остановлено. Уже переведённое сохранено." : "Ошибка: " + err.message, "err");
     } finally {
       $("go").disabled = false;
       $("cancel").style.display = "none";
+      try { await wakeLock?.release(); } catch {}
     }
   };
 })();
