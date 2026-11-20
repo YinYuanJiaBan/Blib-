@@ -246,6 +246,8 @@ def load_from_epub(path, limit=None):
             head = re.search(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", body, re.S | re.I)
             paras = [_xml_text(p) for p in re.findall(r"<p\b[^>]*>(.*?)</p>", body, re.S | re.I)]
             paras = [p for p in paras if p]
+            if re.search(r"(^|/)about\.xhtml$", item["href"]):  # справка о книге в наших EPUB
+                continue
             if re.search(r"(^|/)title\.xhtml$", item["href"]):  # титульная страница наших EPUB
                 description = paras
                 continue
@@ -291,15 +293,21 @@ class BaseTranslator:
         self.cache = cache
         self.missed = 0
 
-    def _batch(self, texts):
+    context_items = 0  # сколько предыдущих абзацев показывать модели как контекст
+
+    def _batch(self, texts, context=()):
         raise NotImplementedError
 
     def cache_prefix(self):
         return self.name
 
+    def passthrough(self, text):
+        """Строка без иероглифов (знаки препинания, цифры) — в перевод не отправляется."""
+        return text
+
     def translate(self, texts, progress=None):
         """Переводит список строк. Строки без иероглифов возвращает как есть."""
-        result = list(texts)
+        result = [t if HAN.search(t) else self.passthrough(t) for t in texts]
         idx = [i for i, t in enumerate(texts) if HAN.search(t)]
         todo = [texts[i] for i in idx]
         batches = make_batches(todo, self.max_chars, self.max_items)
@@ -312,7 +320,9 @@ class BaseTranslator:
             key = "tr:" + prefix + ":" + hashlib.sha1("\u0001".join(part).encode()).hexdigest()
             out = self.cache.get(key)
             if not (isinstance(out, list) and len(out) == len(part)):
-                out = self._batch(part)
+                start = batch[0]
+                context = todo[max(0, start - self.context_items):start] if self.context_items else []
+                out = self._batch(part, context)
                 if all(out):
                     self.cache.put(key, out)
             with lock:
@@ -342,7 +352,7 @@ class GoogleTranslator(BaseTranslator):
     def cache_prefix(self):
         return f"google:{self.dst}"
 
-    def _batch(self, texts):
+    def _batch(self, texts, context=()):
         url = f"{GOOGLE_URL}?client=gtx&sl=zh-CN&tl={self.dst}&format=text"
         body = urllib.parse.urlencode([("q", t) for t in texts]).encode()
         data = json.loads(fetch(url, data=body).decode("utf-8"))
@@ -352,63 +362,99 @@ class GoogleTranslator(BaseTranslator):
         return out
 
 
+def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300):
+    """Один запрос к OpenRouter. Возвращает текст ответа модели."""
+    if not api_key:
+        raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
+    payload = json.dumps({"model": model, "temperature": temperature, "messages": messages}).encode()
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+               "HTTP-Referer": "https://github.com/", "X-Title": "book2epub"}
+    try:
+        data = json.loads(fetch(OPENROUTER_URL, data=payload, headers=headers, retries=1, timeout=timeout))
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 401:
+            raise FatalError("OpenRouter не принял ключ. Проверьте OPENROUTER_API_KEY.") from None
+        if e.code == 402:
+            raise FatalError("На счёте OpenRouter закончились средства.") from None
+        if e.code in (400, 404):
+            raise FatalError(f"OpenRouter отклонил запрос (проверьте модель «{model}»): {msg}") from None
+        raise RuntimeError(f"HTTP {e.code}: {msg}") from None
+    if data.get("error"):
+        raise RuntimeError(data["error"].get("message", "ошибка модели"))
+    return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+
+
+TRANSLATOR_PROMPT = """Ты профессиональный литературный переводчик с китайского языка на русский. \
+Переводи художественно, точно и естественно для русского читателя, сохраняя стиль, тон, диалоги и смысл оригинала.
+
+Точность:
+1. Ничего не добавляй от себя и ничего не пропускай: жесты, взгляды, паузы, оттенки чувств, детали обстановки должны остаться.
+2. Сохраняй образы и сравнения оригинала и их порядок (水火 — «вода и огонь», а не «огонь и вода»). Не подменяй образ другим.
+3. Многозначные слова переводи по контексту, а не по первому словарному значению: 性 в описании характера — «нрав», \
+阅 — «читать», 评注 — «отзыв». Не разбирай устойчивые слова на части (浮生 — «бренная жизнь»).
+4. Сохраняй реалии эпохи: кисть и тушь (не перо и чернила), свиток, жалованье. Не вводи современные и европейские реалии.
+5. Кто действует и к кому обращено действие — строго как в оригинале. Род и число согласуй по справке о персонажах.
+6. Надписи, указы, письма, стихи и запреты переводи с сохранением каждого значимого слова.
+7. Передавай тон словами: нахальство, холодность, иронию, просторечие, архаику.
+
+Оформление:
+- Прямая речь — по-русски, через тире: «— Реплика, — сказал он. — Продолжение». После слов автора с двоеточием: «Он сказал: — Реплика».
+- Китайские кавычки “” 「」 в прямой речи заменяй тире; в цитатах и названиях — кавычки-«ёлочки». «……» → «…»; \
+реплика из одного многоточия — «— …».
+- Имена, фамилии и топонимы — по системе Палладия, кириллицей, единообразно во всём тексте; имена из глоссария — строго как в глоссарии.
+- Не добавляй комментариев, примечаний, сносок и транслитерации в скобках.
+
+Формат: каждый фрагмент начинается с метки вида ⟦N⟧. Верни перевод каждого фрагмента, начиная его с той же метки, \
+в том же порядке. Не пропускай, не объединяй и не разбивай фрагменты. Не выводи ничего, кроме фрагментов с метками. \
+Абзацы под заголовком «Контекст» не переводи и не выводи: они нужны только для понимания."""
+
+
 class OpenRouterTranslator(BaseTranslator):
     """Перевод через OpenRouter (по умолчанию DeepSeek) с метками ⟦N⟧ у фрагментов."""
     name = "openrouter"
     max_chars, max_items, workers = 1800, 40, 3
+    context_items = 3
 
-    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary=""):
+    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None):
         super().__init__(cache)
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
         self.api_key, self.model = api_key, model or DEFAULT_MODEL
-        self.system = (
-            "Ты профессиональный литературный переводчик с китайского языка на русский. "
-            "Переводи художественно, точно и естественно для русского читателя, сохраняя стиль, тон, "
-            "диалоги и смысл оригинала. Китайские имена, фамилии и топонимы передавай по системе Палладия, "
-            "кириллицей, единообразно во всём тексте. Не добавляй комментариев, примечаний, пояснений "
-            "и транслитерации в скобках.\n"
-            "Формат: каждый фрагмент начинается с метки вида ⟦N⟧. Верни перевод каждого фрагмента, "
-            "начиная его с той же метки, в том же порядке. Не пропускай, не объединяй и не разбивай "
-            "фрагменты. Не выводи ничего, кроме фрагментов с метками.")
+        self.system = TRANSLATOR_PROMPT
         if book_title:
-            self.system += f"\nКнига: «{book_title}»."
-        if glossary.strip():
-            self.system += "\nОбязательный глоссарий (оригинал = перевод):\n" + glossary.strip()
+            self.system += f"\n\nКнига: «{book_title}»" + (f" (по-русски: «{card['title_ru']}»)"
+                                                          if card and card.get("title_ru") else "") + "."
+        if card:
+            self.system += "\n\n" + card_brief(card)
+        gl = merge_glossary(card_glossary(card) if card else "", glossary)
+        if gl:
+            self.system += "\n\nОбязательный глоссарий (оригинал = перевод):\n" + gl
 
     def cache_prefix(self):
         return f"openrouter:{self.model}:{self.system}"
 
-    def _call(self, texts):
-        body = "\n\n".join(f"⟦{i + 1}⟧ {t}" for i, t in enumerate(texts))
-        payload = json.dumps({
-            "model": self.model, "temperature": 0.3,
-            "messages": [{"role": "system", "content": self.system}, {"role": "user", "content": body}],
-        }).encode()
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
-                   "HTTP-Referer": "https://github.com/", "X-Title": "book2epub"}
-        try:
-            data = json.loads(fetch(OPENROUTER_URL, data=payload, headers=headers, retries=1, timeout=300))
-        except urllib.error.HTTPError as e:
-            msg = e.read().decode("utf-8", "replace")[:300]
-            if e.code == 401:
-                raise FatalError("OpenRouter не принял ключ. Проверьте OPENROUTER_API_KEY.") from None
-            if e.code == 402:
-                raise FatalError("На счёте OpenRouter закончились средства.") from None
-            if e.code in (400, 404):
-                raise FatalError(f"OpenRouter отклонил запрос (проверьте модель «{self.model}»): {msg}") from None
-            raise RuntimeError(f"HTTP {e.code}: {msg}") from None
-        if data.get("error"):
-            raise RuntimeError(data["error"].get("message", "ошибка модели"))
-        out = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    def passthrough(self, text):
+        # Реплика-молчание “……” → «— …», китайское многоточие → русское.
+        t = text.replace("……", "…").replace("。", ".")
+        m = re.fullmatch(r"\s*[“「『\"]\s*([…\.!?！？—\s]+?)\s*[”」』\"]\s*", t)
+        return "— " + m.group(1).replace("！", "!").replace("？", "?") if m else t
+
+    def _call(self, texts, context=()):
+        body = ""
+        if context:
+            body = "Контекст (предыдущие абзацы, не переводить):\n" + "\n".join(context) + "\n\nПереведи:\n"
+        body += "\n\n".join(f"⟦{i + 1}⟧ {t}" for i, t in enumerate(texts))
+        out = openrouter_chat(self.api_key, self.model,
+                              [{"role": "system", "content": self.system}, {"role": "user", "content": body}])
         parts = {int(n): t.strip() for n, t in re.findall(r"⟦(\d+)⟧\s*(.*?)(?=⟦\d+⟧|\Z)", out, re.S)}
         return [parts.get(i + 1) for i in range(len(texts))]
 
-    def _batch(self, texts):
+    def _batch(self, texts, context=()):
         last, incomplete = None, False
         for attempt in range(5):
             try:
-                res = self._call(texts)
+                res = self._call(texts, context)
                 if all(res):
                     return res
                 last, incomplete = "модель вернула не все фрагменты", True
@@ -421,9 +467,192 @@ class OpenRouterTranslator(BaseTranslator):
             time.sleep(min(30, 2 * 2 ** attempt))
         if incomplete and len(texts) > 1:
             mid = (len(texts) + 1) // 2
-            return self._batch(texts[:mid]) + self._batch(texts[mid:])
+            first = texts[:mid]
+            return self._batch(first, context) + self._batch(texts[mid:], first[-self.context_items:])
         print(f"  не переведено фрагментов: {len(texts)} ({last})", file=sys.stderr)
         return [None] * len(texts)
+
+
+# ---------------------------------------------------------------- справка о книге
+CARD_PROMPT = """Ты редактор-синолог. Готовишь справку о китайской книге для переводчиков на русский язык.
+Если ты узнаёшь книгу (классика, известный роман, веб-новелла), используй свои знания о ней: устоявшиеся \
+русское и английское названия, сюжет, главных героев всей книги. Если не узнаёшь или не уверен, опирайся только \
+на присланный отрывок и ничего не выдумывай.
+Китайские имена и названия передавай по системе Палладия (墨熄 — Мо Си, 顾茫 — Гу Ман, 重华 — Чунхуа).
+Ответь ТОЛЬКО объектом JSON без пояснений и без ```:
+{
+  "known": true или false — узнал ли ты книгу,
+  "title_ru": "русское название: устоявшееся, если есть, иначе твой литературный перевод",
+  "title_literal": "буквальный перевод названия",
+  "title_en": "английское название, если есть, иначе пустая строка",
+  "title_pinyin": "название пиньинем с тонами",
+  "author_ru": "автор по-русски (псевдоним можно перевести по смыслу)",
+  "genre": "жанр по-русски, коротко",
+  "synopsis": "о чём книга, 3–6 предложений по-русски, без спойлеров финала",
+  "characters": [{"zh": "иероглифы имени", "pinyin": "пиньинь", "ru": "имя по Палладию", \
+"gender": "м" или "ж", "role": "кто это, одно короткое предложение"}],
+  "terms": [{"zh": "иероглифы", "ru": "как переводить", "note": "что это, коротко"}]
+}
+В characters — до 15 главных персонажей (сначала главные герои). В terms — до 15 важных мест, \
+государств, титулов, сект и терминов. Иероглифы в zh — ровно как в тексте книги."""
+
+CYR = re.compile(r"[А-Яа-яЁё]")
+
+
+def book_sample(book, max_chars=12000):
+    """Начало книги для справки: название, автор, описание и первые главы."""
+    lines = [f"Название: {book['title']}", f"Автор: {book.get('author') or 'неизвестен'}"]
+    if book.get("description"):
+        lines.append("Описание: " + " ".join(book["description"]))
+    lines.append("")
+    size = sum(len(x) for x in lines)
+    for ch in book["chapters"]:
+        for line in [f"## {ch['title']}", *ch["paras"]]:
+            if size + len(line) > max_chars:
+                return "\n".join(lines)
+            lines.append(line)
+            size += len(line)
+    return "\n".join(lines)
+
+
+def _clean(v, limit=600):
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:limit]
+
+
+def parse_card(text):
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        raw = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    card = {k: _clean(raw.get(k), 1500 if k == "synopsis" else 200)
+            for k in ("title_ru", "title_literal", "title_en", "title_pinyin", "author_ru", "genre", "synopsis")}
+    card["known"] = raw.get("known") is True
+    card["characters"], card["terms"] = [], []
+    for key, fields in (("characters", ("zh", "pinyin", "ru", "gender", "role")), ("terms", ("zh", "ru", "note"))):
+        seen = set()
+        for item in raw.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            row = {f: _clean(item.get(f), 300) for f in fields}
+            if not (HAN.search(row["zh"]) and CYR.search(row["ru"])) or row["zh"] in seen:
+                continue
+            seen.add(row["zh"])
+            card[key].append(row)
+        card[key] = card[key][:20]
+    if not (card["title_ru"] or card["synopsis"] or card["characters"]):
+        return None
+    return card
+
+
+def make_card(book, cache, api_key, model=DEFAULT_MODEL):
+    """Справка о книге: русское название, о чём она, персонажи и термины. Кэшируется."""
+    model = model or DEFAULT_MODEL
+    sample = book_sample(book)
+    key = "card:v1:" + model + ":" + hashlib.sha1(sample.encode()).hexdigest()
+    cached = cache.get(key)
+    if isinstance(cached, dict):
+        return cached
+    last = None
+    for attempt in range(3):
+        try:
+            card = parse_card(openrouter_chat(api_key, model, [
+                {"role": "system", "content": CARD_PROMPT},
+                {"role": "user", "content": "Начало книги:\n\n" + sample}], temperature=0.2))
+            if card:
+                cache.put(key, card)
+                return card
+            last = "модель вернула справку в неверном формате"
+        except FatalError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            last = e
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"не удалось составить справку о книге: {last}")
+
+
+def parse_glossary(text):
+    pairs = {}
+    for line in (text or "").splitlines():
+        m = re.match(r"\s*(.+?)\s*[=＝]\s*(.+?)\s*$", line)
+        if m:
+            pairs[m.group(1)] = m.group(2)
+    return pairs
+
+
+def card_glossary(card):
+    return "\n".join(f"{x['zh']} = {x['ru']}" for x in card.get("characters", []) + card.get("terms", []))
+
+
+def merge_glossary(auto, user):
+    """Глоссарий из справки + глоссарий пользователя (у пользователя приоритет)."""
+    pairs = parse_glossary(auto)
+    pairs.update(parse_glossary(user))
+    return "\n".join(f"{k} = {v}" for k, v in pairs.items())
+
+
+def apply_user_glossary(card, user):
+    """Подставляет в справку имена из глоссария пользователя, чтобы справка и перевод совпадали."""
+    pairs = parse_glossary(user)
+    for row in card.get("characters", []) + card.get("terms", []):
+        if row["zh"] in pairs:
+            row["ru"] = pairs[row["zh"]]
+    return card
+
+
+def card_brief(card):
+    """Справка в коротком виде для системного промпта переводчика."""
+    lines = ["Справка о книге (для понимания контекста, не переводи её):"]
+    if card.get("genre"):
+        lines.append(f"Жанр: {card['genre']}.")
+    if card.get("synopsis"):
+        lines.append(f"Сюжет: {card['synopsis']}")
+    if card.get("characters"):
+        lines.append("Персонажи:")
+        for c in card["characters"]:
+            g = {"м": "муж.", "ж": "жен."}.get(c.get("gender", "")[:1].lower(), "")
+            lines.append(f"- {c['ru']} ({c['zh']})" + (f", {g}" if g else "") + (f": {c['role']}" if c.get("role") else ""))
+    return "\n".join(lines)
+
+
+def format_card(card, orig_title="", orig_author=""):
+    """Справка о книге для сообщения в Telegram или консоли."""
+    out = ["📚 Справка о книге", ""]
+    title = card.get("title_ru") or orig_title
+    out.append(f"Название: {title}")
+    if orig_title:
+        out.append(f"Оригинал: {orig_title}" + (f" ({card['title_pinyin']})" if card.get("title_pinyin") else ""))
+    if card.get("title_literal") and card["title_literal"] != title:
+        out.append(f"Дословно: {card['title_literal']}")
+    if card.get("title_en"):
+        out.append(f"По-английски: {card['title_en']}")
+    if orig_author or card.get("author_ru"):
+        a = card.get("author_ru") or ""
+        out.append("Автор: " + (f"{a} ({orig_author})" if a and orig_author and a != orig_author else a or orig_author))
+    if card.get("genre"):
+        out.append(f"Жанр: {card['genre']}")
+    if card.get("synopsis"):
+        out += ["", "О чём: " + card["synopsis"]]
+    if card.get("characters"):
+        out += ["", "👥 Персонажи"]
+        for c in card["characters"]:
+            g = c.get("gender", "")[:1].lower()
+            extra = ", ".join(x for x in (c.get("pinyin"), g + "." if g in ("м", "ж") else "") if x)
+            out.append(f"• {c['ru']} — {c['zh']}" + (f" ({extra})" if extra else "")
+                       + (f": {c['role']}" if c.get("role") else ""))
+    if card.get("terms"):
+        out += ["", "📍 Места и термины"]
+        for t in card["terms"]:
+            out.append(f"• {t['ru']} — {t['zh']}" + (f": {t['note']}" if t.get("note") else ""))
+    out += ["", "ℹ️ Справку составила нейросеть " +
+            ("по своим знаниям о книге и её первым главам." if card.get("known")
+             else "только по первым главам: книгу она не узнала, сюжет описан по началу.") +
+            " Эти имена будут использованы в переводе. Поправить имя: добавьте к ссылке строку «顾茫 = Гу Ман»."]
+    return "\n".join(out)
 
 
 def translate_book(book, translator, bilingual=False, progress=None):
@@ -437,6 +666,11 @@ def translate_book(book, translator, bilingual=False, progress=None):
     it = iter(out)
     book["orig_title"], book["title"] = book["title"], next(it)
     book["orig_author"], book["author"] = book["author"], next(it)
+    card = book.get("card") or {}
+    if card.get("title_ru"):
+        book["title"] = card["title_ru"]
+    if card.get("author_ru") and book["orig_author"]:
+        book["author"] = card["author_ru"]
     book["description"] = [next(it) for _ in book["description"]]
     for ch in book["chapters"]:
         ch["orig_title"], ch["title"] = ch["title"], next(it)
@@ -461,7 +695,26 @@ h2{font-size:1.25em;text-align:center;margin:1em 0}
 p{text-indent:2em;margin:0 0 .5em;text-align:justify}
 p.orig{color:#555;font-size:.92em;margin-bottom:.15em}
 p.meta{text-indent:0;text-align:center;font-style:italic}
+p.item{text-indent:0;margin-bottom:.4em}
 """
+
+
+def about_body(card):
+    esc = html.escape
+    parts = ["<h1>О книге</h1>"]
+    for label, key in (("Дословно", "title_literal"), ("По-английски", "title_en"), ("Жанр", "genre")):
+        if card.get(key):
+            parts.append(f'<p class="meta">{label}: {esc(card[key])}</p>')
+    if card.get("synopsis"):
+        parts.append(f"<p>{esc(card['synopsis'])}</p>")
+    for head, key, note in (("Персонажи", "characters", "role"), ("Места и термины", "terms", "note")):
+        if card.get(key):
+            parts.append(f"<h2>{head}</h2>")
+            for x in card[key]:
+                zh = x["zh"] + (f", {x['pinyin']}" if x.get("pinyin") else "")
+                parts.append(f'<p class="item"><b>{esc(x["ru"])}</b> ({esc(zh)})'
+                             + (f" — {esc(x[note])}" if x.get(note) else "") + "</p>")
+    return "\n".join(parts)
 
 
 def build_epub(path, book, lang):
@@ -480,6 +733,8 @@ def build_epub(path, book, lang):
                   + (f'<p class="meta">{esc(author_line)}</p>' if author_line else "")
                   + "".join(f"<p>{esc(p)}</p>" for p in book["description"]))
     files.append(("title", "title.xhtml", book["title"], xhtml(book["title"], title_body, lang)))
+    if book.get("card"):
+        files.append(("about", "about.xhtml", "О книге", xhtml("О книге", about_body(book["card"]), "ru")))
 
     for n, ch in enumerate(book["chapters"], 1):
         parts = [f"<h2>{esc(ch['title'])}</h2>"]
@@ -587,7 +842,15 @@ def main():
     if args.translate:
         if args.engine == "openrouter":
             glossary = open(args.glossary, encoding="utf-8").read() if args.glossary else ""
-            tr = OpenRouterTranslator(cache, os.environ.get("OPENROUTER_API_KEY", ""), args.model, orig_title, glossary)
+            key = os.environ.get("OPENROUTER_API_KEY", "")
+            try:
+                book["card"] = apply_user_glossary(make_card(book, cache, key, args.model), glossary)
+                print(format_card(book["card"], orig_title, book["author"]))
+            except FatalError:
+                raise
+            except Exception as e:  # noqa: BLE001 — без справки перевод всё равно возможен
+                print(f"  справка не составлена: {e}")
+            tr = OpenRouterTranslator(cache, key, args.model, orig_title, glossary, book.get("card"))
             lang = "ru"
         else:
             tr = GoogleTranslator(cache, args.lang)
