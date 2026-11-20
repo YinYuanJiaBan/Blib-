@@ -1,0 +1,40 @@
+name: Книга для Telegram-бота
+
+on:
+  repository_dispatch:
+    types: [build-book]
+
+permissions:
+  contents: read
+
+# Задачи одного чата выполняются по очереди.
+concurrency:
+  group: book-${{ github.event.client_payload.chat_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      # Кэш скачанных глав и переводов: если задача упала, повтор продолжит с того же места.
+      - uses: actions/cache/restore@v4
+        with:
+          path: .book2epub_cache
+          key: book2epub-${{ github.run_id }}
+          restore-keys: book2epub-
+
+      - name: Собрать и отправить книгу
+        run: python3 bot/job.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .book2epub_cache
+          key: book2epub-${{ github.run_id }}
