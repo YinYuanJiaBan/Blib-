@@ -1,0 +1,6 @@
+# Настройки воркера веб-страницы. Имя воркера задаётся при деплое
+# через переменную GitHub WEB_WORKER_NAME (см. .github/workflows/deploy-workers.yml).
+name = "book-epub"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+keep_vars = true

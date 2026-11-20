@@ -1,0 +1,49 @@
+name: Обновление воркеров Cloudflare
+
+on:
+  push:
+    paths:
+      - "bot/worker.js"
+      - "bot/wrangler.toml"
+      - "web/index.html"
+      - "web/worker.template.js"
+      - "web/build.py"
+      - "web/wrangler.toml"
+      - ".github/workflows/deploy-workers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-workers
+  cancel-in-progress: true
+
+jobs:
+  bot:
+    name: Бот (book-bot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: bot
+          command: deploy
+
+  web:
+    name: Веб-страница
+    # Включается, когда в Variables задано имя воркера страницы (WEB_WORKER_NAME).
+    if: ${{ vars.WEB_WORKER_NAME != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать worker.js из index.html
+        run: python3 web/build.py
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deploy --name ${{ vars.WEB_WORKER_NAME }}

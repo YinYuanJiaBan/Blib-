@@ -1,3 +1,5 @@
 zh-ru-translator.zip
 __pycache__/
 .book2epub_cache/
+.wrangler/
+node_modules/

@@ -1,0 +1,6 @@
+# Настройки воркера Telegram-бота для автодеплоя из GitHub Actions.
+name = "book-bot"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+# Не трогать переменные, заданные в панели Cloudflare (ALLOWED_USERS, GH_REPO и т. д.).
+keep_vars = true

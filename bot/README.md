@@ -61,6 +61,14 @@ GitHub → аватар → **Settings → Developer settings → Personal acces
 
 Готово: отправьте боту ссылку.
 
+## Автообновление воркеров
+Воркеры в Cloudflare обновляются сами при каждом изменении кода в GitHub (`.github/workflows/deploy-workers.yml`). Для этого один раз добавьте секреты в **Settings → Secrets and variables → Actions**:
+- `CLOUDFLARE_API_TOKEN`: в Cloudflare откройте **My Profile → API Tokens → Create Token**, выберите шаблон **Edit Cloudflare Workers**, затем **Continue to summary → Create Token**;
+- `CLOUDFLARE_ACCOUNT_ID`: ID аккаунта, он показан на странице **Workers & Pages** справа (Account ID).
+
+Веб-страница обновляется так же, если на вкладке **Variables** задать `WEB_WORKER_NAME`, то есть имя её воркера.
+Переменные и секреты, заданные в панели Cloudflare, при обновлении сохраняются.
+
 ## Если что-то не так
 - **Бот молчит.** Откройте `/setup?key=…` ещё раз и проверьте галочки.
 - **«GitHub не принял задачу».** Проверьте `GH_TOKEN` (права Contents: Read and write на репозиторий Blib-) и `GH_REPO`.
