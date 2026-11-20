@@ -31,7 +31,7 @@ Telegram → Cloudflare Worker (bot/worker.js) → GitHub Actions (bot/job.py) �
 - `TELEGRAM_BOT_TOKEN` — токен бота;
 - `OPENROUTER_API_KEY` — ключ OpenRouter (`sk-or-v1-…`).
 
-Модель можно сменить: на вкладке **Variables** создайте `OPENROUTER_MODEL`, например `deepseek/deepseek-r1`. По умолчанию используется `deepseek/deepseek-chat`.
+Модель можно сменить: на вкладке **Variables** создайте `OPENROUTER_MODEL`, например `deepseek/deepseek-v4-pro`. По умолчанию используется `deepseek/deepseek-chat`.
 
 ### 3. Токен GitHub для воркера
 GitHub → аватар → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**:
