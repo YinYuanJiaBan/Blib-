@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Книга в EPUB</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73;
+    --line: #e3e1dc; --accent: #b4442c; --accent-text: #fff; --ok: #2e7d4f; --on-ok: #fff; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161616; --card: #1f1f1f; --text: #f2f2f2; --muted: #a1a1a6;
+      --line: #333; --accent: #e0694f; --accent-text: #111; --ok: #6fcf97; --on-ok: #0d2a1a; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 28px; margin: 0 0 4px; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  label { display: block; font-weight: 600; margin-bottom: 8px; }
+  input[type=url], input[type=number] { width: 100%; font: inherit; padding: 12px 14px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .row { display: flex; gap: 12px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  .row label { margin: 0; font-weight: 400; color: var(--muted); }
+  .row input[type=number] { width: 110px; padding: 8px 10px; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 13px 18px;
+    background: var(--accent); color: var(--accent-text); cursor: pointer; width: 100%; margin-top: 16px; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  #status { margin-top: 20px; display: none; }
+  .book-title { font-size: 20px; font-weight: 700; margin: 0; }
+  .book-author { color: var(--muted); margin: 2px 0 12px; }
+  progress { width: 100%; height: 10px; accent-color: var(--accent); }
+  .msg { margin-top: 10px; color: var(--muted); font-size: 15px; word-break: break-word; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+  a.download { display: block; text-align: center; text-decoration: none; margin-top: 14px; padding: 13px;
+    border-radius: 10px; background: var(--ok); color: var(--on-ok); font-weight: 600; }
+  .note { color: var(--muted); font-size: 14px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Книга в EPUB</h1>
+  <p class="sub">Вставьте ссылку на оглавление книги на kanunu8.com, и страница соберёт её в EPUB на языке оригинала.</p>
+
+  <form class="card" id="form">
+    <label for="url">Ссылка на оглавление</label>
+    <input type="url" id="url" required placeholder="https://www.kanunu8.com/files/old/2011/2560.html" autocomplete="off">
+    <div class="row">
+      <label for="limit">Только первые глав:</label>
+      <input type="number" id="limit" min="1" placeholder="все">
+    </div>
+    <button type="submit" id="go">Собрать EPUB</button>
+  </form>
+
+  <section class="card" id="status" aria-live="polite">
+    <p class="book-title" id="bookTitle"></p>
+    <p class="book-author" id="bookAuthor"></p>
+    <progress id="bar" value="0" max="1"></progress>
+    <div class="msg" id="msg"></div>
+    <div id="result"></div>
+    <button type="button" class="secondary" id="cancel">Остановить</button>
+  </section>
+
+  <p class="note">Для книг в общественном достоянии (классика) или текстов, на которые у вас есть права.</p>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const PROXY = "fetch?url=";      // относительный путь к прокси того же воркера
+  const WORKERS = 4;               // параллельных загрузок глав
+  let abort = null;
+
+  // ---------- загрузка и декодирование ----------
+  async function getPage(url, signal) {
+    let last;
+    for (let i = 0; i < 4; i++) {
+      try {
+        const r = await fetch(PROXY + encodeURIComponent(url), { signal });
+        if (!r.ok) throw new Error((await r.text()) || "HTTP " + r.status);
+        const buf = await r.arrayBuffer();
+        const head = new TextDecoder("latin1").decode(buf.slice(0, 2000));
+        let enc = (head.match(/charset=["']?([\w-]+)/i) || [, "gbk"])[1].toLowerCase();
+        if (["gb2312", "gbk", "gb18030"].includes(enc)) enc = "gb18030";
+        return new TextDecoder(enc).decode(buf);
+      } catch (e) {
+        if (signal.aborted) throw e;
+        last = e;
+        await new Promise((res) => setTimeout(res, 1200 * (i + 1)));
+      }
+    }
+    throw last;
+  }
+
+  const clean = (s) => (s || "").replace(/ /g, " ").trim();
+
+  // ---------- разбор оглавления ----------
+  function parseIndex(url, html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const pageTitle = clean(doc.title);
+    let title = clean(doc.querySelector("h1")?.textContent) || clean(doc.querySelector("h2")?.textContent)
+      || pageTitle.split(/\s*[-_]\s*|\s+by\s+/)[0];
+
+    let author = "";
+    const m1 = html.match(/作者[：:]\s*([^<\s]+)/);
+    const m2 = pageTitle.match(/\bby\s+([^\s-]+)/) || pageTitle.match(/-\s*小说[^-]*-\s*([^-]+?)\s*-/);
+    if (m1) author = m1[1]; else if (m2) author = m2[1];
+
+    const description = clean(doc.querySelector('meta[name="description"]')?.getAttribute("content"));
+
+    // Главы: относительные ссылки «12345.html» или «2560/12345.html».
+    const chapters = [], seen = new Set();
+    for (const a of doc.querySelectorAll("a[href]")) {
+      const href = a.getAttribute("href").trim();
+      if (/^(\/|https?:|\.\.|#|javascript)/i.test(href)) continue;
+      if (!/^(?:[\w-]+\/)?\d+\.html$/.test(href)) continue;
+      const full = new URL(href, url).href;
+      if (seen.has(full)) continue;
+      seen.add(full);
+      chapters.push({ url: full, title: clean(a.textContent) || "第" + (chapters.length + 1) + "章" });
+    }
+    return { title, author: clean(author), description, chapters };
+  }
+
+  // ---------- разбор главы: самый крупный <p> ----------
+  function parseChapter(html) {
+    let best = "";
+    for (const m of html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)) if (m[1].length > best.length) best = m[1];
+    if (!best) return [];
+    const box = document.createElement("div");
+    box.innerHTML = best.replace(/<br\s*\/?>/gi, "\n").replace(/<(script|style)[\s\S]*?<\/\1>/gi, "");
+    return box.textContent.split("\n")
+      .map((p) => p.replace(/ /g, " ").replace(/^[\s　]+|[\s　]+$/g, ""))
+      .filter(Boolean);
+  }
+
+  // ---------- сборка EPUB ----------
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const xhtml = (title, body) =>
+    `<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n<html xmlns="http://www.w3.org/1999/xhtml" ` +
+    `xmlns:epub="http://www.idpf.org/2007/ops" lang="zh" xml:lang="zh">\n<head><meta charset="utf-8"/>` +
+    `<title>${esc(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>\n<body>\n${body}\n</body>\n</html>\n`;
+  const CSS = "body{font-family:serif;line-height:1.7;margin:0 4%}h1{font-size:1.5em;text-align:center;margin:1.5em 0 1em}" +
+    "h2{font-size:1.25em;text-align:center;margin:1em 0}p{text-indent:2em;margin:0 0 .5em;text-align:justify}" +
+    "p.meta{text-indent:0;text-align:center;font-style:italic}";
+
+  async function buildEpub(book) {
+    const id = "urn:uuid:" + crypto.randomUUID();
+    const files = [];
+    files.push(["title", "title.xhtml", book.title, xhtml(book.title,
+      `<h1>${esc(book.title)}</h1>` + (book.author ? `<p class="meta">${esc(book.author)}</p>` : "") +
+      (book.description ? `<p>${esc(book.description)}</p>` : ""))]);
+    book.chapters.forEach((ch, i) => {
+      const n = "c" + String(i + 1).padStart(4, "0");
+      files.push([n, n + ".xhtml", ch.title, xhtml(ch.title,
+        `<h2>${esc(ch.title)}</h2>\n` + ch.paras.map((p) => `<p>${esc(p)}</p>`).join("\n"))]);
+    });
+
+    const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+    const opf = `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="zh">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">${id}</dc:identifier>
+<dc:title>${esc(book.title)}</dc:title>
+<dc:creator>${esc(book.author || "—")}</dc:creator>
+<dc:language>zh</dc:language>
+<dc:source>${esc(book.source)}</dc:source>
+<meta property="dcterms:modified">${now}</meta>
+</metadata>
+<manifest>
+<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+<item id="css" href="style.css" media-type="text/css"/>
+${files.map(([i, h]) => `<item id="${i}" href="${h}" media-type="application/xhtml+xml"/>`).join("\n")}
+</manifest>
+<spine toc="ncx">
+${files.map(([i]) => `<itemref idref="${i}"/>`).join("\n")}
+</spine>
+</package>`;
+    const nav = xhtml("目录", `<nav epub:type="toc" id="toc"><h1>目录</h1><ol>\n` +
+      files.map(([, h, t]) => `<li><a href="${h}">${esc(t)}</a></li>`).join("\n") + `\n</ol></nav>`);
+    const ncx = `<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="${id}"/></head>
+<docTitle><text>${esc(book.title)}</text></docTitle>
+<navMap>
+${files.map(([, h, t], k) => `<navPoint id="n${k + 1}" playOrder="${k + 1}"><navLabel><text>${esc(t)}</text></navLabel><content src="${h}"/></navPoint>`).join("\n")}
+</navMap>
+</ncx>`;
+    const zip = new JSZip();
+    const opt = { createFolders: false };
+    zip.file("mimetype", "application/epub+zip", { compression: "STORE", createFolders: false });
+    zip.file("META-INF/container.xml", `<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>`, opt);
+    zip.file("OEBPS/content.opf", opf, opt);
+    zip.file("OEBPS/nav.xhtml", nav, opt);
+    zip.file("OEBPS/toc.ncx", ncx, opt);
+    zip.file("OEBPS/style.css", CSS, opt);
+    for (const [, h, , c] of files) zip.file("OEBPS/" + h, c, opt);
+    return zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: "application/epub+zip" });
+  }
+
+  // ---------- интерфейс ----------
+  function say(text, cls = "") { $("msg").textContent = text; $("msg").className = "msg " + cls; }
+
+  $("cancel").onclick = () => abort?.abort();
+
+  $("form").onsubmit = async (e) => {
+    e.preventDefault();
+    const url = $("url").value.trim();
+    const limit = parseInt($("limit").value, 10) || 0;
+    abort = new AbortController();
+    const { signal } = abort;
+
+    $("go").disabled = true;
+    $("status").style.display = "block";
+    $("cancel").style.display = "block";
+    $("result").innerHTML = "";
+    $("bookTitle").textContent = "";
+    $("bookAuthor").textContent = "";
+    $("bar").value = 0;
+    say("Читаю оглавление…");
+
+    try {
+      const info = parseIndex(url, await getPage(url, signal));
+      const chapters = limit ? info.chapters.slice(0, limit) : info.chapters;
+      if (!chapters.length) throw new Error("Не нашла ни одной главы. Это точно ссылка на оглавление книги?");
+      $("bookTitle").textContent = info.title;
+      $("bookAuthor").textContent = (info.author ? info.author + " · " : "") + "глав: " + chapters.length;
+      $("bar").max = chapters.length;
+
+      let done = 0, next = 0;
+      const failed = [];
+      async function worker() {
+        while (next < chapters.length) {
+          const ch = chapters[next++];
+          try { ch.paras = parseChapter(await getPage(ch.url, signal)); }
+          catch (err) { if (signal.aborted) throw err; ch.paras = []; failed.push(ch.title); }
+          $("bar").value = ++done;
+          say(`Загружено глав: ${done} из ${chapters.length}`);
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(WORKERS, chapters.length) }, worker));
+
+      say("Собираю EPUB…");
+      const blob = await buildEpub({ ...info, chapters, source: url });
+      const name = info.title.replace(/[\\/:*?"<>|\s]+/g, "_") + ".epub";
+      const a = document.createElement("a");
+      a.className = "download";
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.textContent = `Скачать «${name}» (${(blob.size / 1024).toFixed(0)} КБ)`;
+      $("result").appendChild(a);
+      say(failed.length ? `Готово, но не загрузились главы (${failed.length}): ${failed.slice(0, 5).join(", ")}…` : "Готово!",
+          failed.length ? "err" : "ok");
+    } catch (err) {
+      say(signal.aborted ? "Остановлено." : "Ошибка: " + err.message, "err");
+    } finally {
+      $("go").disabled = false;
+      $("cancel").style.display = "none";
+    }
+  };
+})();
+</script>
+</body>
+</html>
