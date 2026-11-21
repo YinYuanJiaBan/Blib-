@@ -263,6 +263,7 @@ def load_from_epub(path, limit=None):
                 continue
             title = _xml_text(head.group(1)) if head else f"Глава {len(chapters) + 1}"
             chapters.append({"title": title, "paras": paras})
+        cover = _epub_cover(z, opf, base, manifest)
     if limit:
         chapters = chapters[:limit]
     if not chapters:
@@ -270,7 +271,34 @@ def load_from_epub(path, limit=None):
     author = meta("creator")
     return {"title": meta("title") or os.path.splitext(os.path.basename(path))[0],
             "author": "" if author == "—" else author, "description": description,
-            "chapters": chapters, "source": os.path.basename(path), "failed": []}
+            "chapters": chapters, "source": os.path.basename(path), "failed": [], "cover": cover}
+
+
+IMAGE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+
+
+def _epub_cover(z, opf, base, manifest):
+    """Обложка из EPUB: (байты, media-type) или None. EPUB 3 cover-image, EPUB 2 <meta name="cover">."""
+    items = [i for i in manifest.values() if i]
+    item = next((i for i in items if "cover-image" in i.get("properties", "").split()), None)
+    if not item:
+        m = re.search(r'<meta\b(?=[^>]*\bname="cover")[^>]*\bcontent="([^"]+)"', opf)
+        item = manifest.get(m.group(1)) if m else None
+    if not item:
+        item = next((i for i in items if i.get("media-type", "").startswith("image/")
+                     and "cover" in (i.get("id", "") + i.get("href", "")).lower()), None)
+    if not item or not item.get("href"):
+        return None
+    name = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(item["href"])))
+    ext = name.rsplit(".", 1)[-1].lower()
+    mtype = item.get("media-type") or IMAGE_TYPES.get(ext, "")
+    if mtype not in IMAGE_TYPES.values():
+        return None
+    try:
+        data = z.read(name)
+    except KeyError:
+        return None
+    return (data, mtype) if 100 < len(data) <= 5 * 1024 * 1024 else None
 
 
 # ---------------------------------------------------------------- перевод
@@ -1010,6 +1038,17 @@ def build_epub(path, book, lang):
             parts.extend(asides)
         files.append((f"c{n:04d}", f"c{n:04d}.xhtml", ch["title"], xhtml(ch["title"], "\n".join(parts), lang)))
 
+    cover = book.get("cover")
+    cover_ext = {v: k for k, v in IMAGE_TYPES.items()}.get(cover[1], "jpg") if cover else ""
+    cover_item = (f'<item id="cover-img" href="cover.{cover_ext}" media-type="{cover[1]}" properties="cover-image"/>'
+                  if cover else "")
+    card = book.get("card") or {}
+    extra_meta = "".join(
+        f"<dc:{tag}>{esc(value)}</dc:{tag}>\n" for tag, value in
+        (("description", card.get("synopsis")), ("subject", card.get("genre"))) if value)
+    if cover:
+        extra_meta += '<meta name="cover" content="cover-img"/>\n'
+
     toc_title = "Содержание" if lang == "ru" else "目录"
     manifest = "\n".join(
         f'<item id="{i}" href="{h}" media-type="application/xhtml+xml"/>' for i, h, _, _ in files)
@@ -1022,12 +1061,13 @@ def build_epub(path, book, lang):
 <dc:creator>{esc(book["author"] or "—")}</dc:creator>
 <dc:language>{lang}</dc:language>
 <dc:source>{esc(book["source"])}</dc:source>
-<meta property="dcterms:modified">{now}</meta>
+{extra_meta}<meta property="dcterms:modified">{now}</meta>
 </metadata>
 <manifest>
 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
 <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
 <item id="css" href="style.css" media-type="text/css"/>
+{cover_item}
 {manifest}
 </manifest>
 <spine toc="ncx">
@@ -1061,6 +1101,8 @@ def build_epub(path, book, lang):
             z.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
         for _, h, _, content in files:
             z.writestr(f"OEBPS/{h}", content, compress_type=zipfile.ZIP_DEFLATED)
+        if cover:
+            z.writestr(f"OEBPS/cover.{cover_ext}", cover[0], compress_type=zipfile.ZIP_STORED)
 
 
 def safe_filename(s):

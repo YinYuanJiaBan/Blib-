@@ -2,6 +2,8 @@ name: Обновление воркеров Cloudflare
 
 on:
   push:
+    # Только из master: незаконченная работа в других ветках не попадает в настоящего бота.
+    branches: [master]
     paths:
       - "bot/worker.js"
       - "bot/wrangler.toml"

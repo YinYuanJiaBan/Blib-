@@ -296,9 +296,14 @@ def main():
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
         request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes") if k in P}
+        # Справка для карточки книги в мини-приложении.
+        info = {"author": c.get("author_ru") or book.get("author") or head.get("author"),
+                "orig_author": book.get("orig_author") or head.get("author"), "genre": c.get("genre"),
+                "synopsis": c.get("synopsis"), "title_en": c.get("title_en"),
+                "title_literal": c.get("title_literal"), "title_pinyin": c.get("title_pinyin")}
         saved = save_to_library(file_ids[0], file_ids=file_ids, title=book["title"], orig_title=orig_title,
                                 mode=mode, chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
-                                request=request)
+                                request=request, info={k: v for k, v in info.items() if v})
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 
