@@ -1,4 +1,4 @@
-name: Готовая часть перевода
+name: Готовая часть перевода и пробные сборки
 
 # Собирает EPUB только из уже переведённого (кэш прошлых запусков), без запросов к модели.
 # Запускается, когда в ветку кладут bot/partial.json:
@@ -35,6 +35,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          # Необязательно: лимит расходов на одну книгу в долларах и провайдер OpenRouter (например, DeepSeek).
+          TRANSLATE_BUDGET_USD: ${{ vars.TRANSLATE_BUDGET_USD }}
+          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
 
       - name: Зашифровать и положить в ветку
         if: env.OUT_DIR != ''

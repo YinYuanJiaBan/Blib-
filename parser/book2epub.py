@@ -287,15 +287,41 @@ def make_batches(texts, max_chars, max_items):
     return batches
 
 
+class Usage:
+    """Счётчик токенов и денег по ответам OpenRouter (потокобезопасный)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.calls = self.prompt = self.cached = self.completion = 0
+        self.cost = 0.0
+
+    def add(self, u):
+        with self.lock:
+            self.calls += 1
+            self.prompt += int(u.get("prompt_tokens") or 0)
+            self.cached += int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+            self.completion += int(u.get("completion_tokens") or 0)
+            self.cost += float(u.get("cost") or 0)
+
+    def summary(self):
+        def num(x):
+            return f"{x:,}".replace(",", " ")
+        cached = f" (из кэша {100 * self.cached // self.prompt}%)" if self.prompt else ""
+        return (f"запросов {self.calls}, токенов: вход {num(self.prompt)}{cached}, выход {num(self.completion)}, "
+                f"≈${self.cost:.2f}")
+
+
 class BaseTranslator:
     max_chars, max_items, workers = 4000, 80, 3
     name = "base"
+    context_items = 0  # сколько предыдущих абзацев показывать модели как контекст
 
     def __init__(self, cache):
         self.cache = cache
         self.missed = 0
-
-    context_items = 0  # сколько предыдущих абзацев показывать модели как контекст
+        self.from_cache = 0
+        self.stop_reason = ""  # не пусто — новые запросы больше не отправляются (например, исчерпан бюджет)
+        self.on_plan = None    # on_plan(всего абзацев, уже в кэше, иероглифов осталось) — перед началом перевода
 
     def _batch(self, texts, context=()):
         raise NotImplementedError
@@ -307,32 +333,50 @@ class BaseTranslator:
         """Строка без иероглифов (знаки препинания, цифры) — в перевод не отправляется."""
         return text
 
+    def legacy_lookup(self, todo, out):
+        """Подставляет в out переводы, сохранённые прежними версиями программы под другими ключами."""
+
     def translate(self, texts, progress=None):
-        """Переводит список строк. Строки без иероглифов возвращает как есть."""
+        """Переводит список строк. Строки без иероглифов возвращает как есть.
+        Кэш — по абзацам, поэтому размер пакетов можно менять, не теряя готового."""
         result = [t if HAN.search(t) else self.passthrough(t) for t in texts]
         idx = [i for i, t in enumerate(texts) if HAN.search(t)]
         todo = [texts[i] for i in idx]
-        batches = make_batches(todo, self.max_chars, self.max_items)
         prefix = hashlib.sha1(self.cache_prefix().encode()).hexdigest()[:12]
+
+        def pkey(t):
+            return "p:" + prefix + ":" + hashlib.sha1(t.encode()).hexdigest()
+
+        out = [None] * len(todo)
+        for j, t in enumerate(todo):
+            v = self.cache.get(pkey(t))
+            if isinstance(v, str) and v:
+                out[j] = v
+        found = [bool(v) for v in out]
+        self.legacy_lookup(todo, out)
+        for j, v in enumerate(out):
+            if v and not found[j]:
+                self.cache.put(pkey(todo[j]), v)
+
+        pending = [j for j, v in enumerate(out) if not v]
+        self.from_cache = len(todo) - len(pending)
+        if self.on_plan:
+            self.on_plan(len(todo), self.from_cache, sum(len(todo[j]) for j in pending))
+        groups = make_batches([todo[j] for j in pending], self.max_chars, self.max_items)
+        batches = [[pending[k] for k in g] for g in groups]
         done = [0]
         lock = threading.Lock()
 
         def run(batch):
-            part = [todo[i] for i in batch]
-            key = "tr:" + prefix + ":" + hashlib.sha1("\u0001".join(part).encode()).hexdigest()
-            out = self.cache.get(key)
-            if not (isinstance(out, list) and len(out) == len(part)):
+            if not self.stop_reason:
                 start = batch[0]
                 context = todo[max(0, start - self.context_items):start] if self.context_items else []
-                out = self._batch(part, context)
-                if all(out):
-                    self.cache.put(key, out)
-            with lock:
-                for i, v in zip(batch, out):
+                res = self._batch([todo[j] for j in batch], context)
+                for j, v in zip(batch, res):
                     if v:
-                        result[idx[i]] = v
-                    else:
-                        self.missed += 1
+                        out[j] = v
+                        self.cache.put(pkey(todo[j]), v)
+            with lock:
                 done[0] += 1
                 if progress:
                     progress("translate", done[0], len(batches))
@@ -340,6 +384,11 @@ class BaseTranslator:
         with cf.ThreadPoolExecutor(self.workers) as ex:
             for f in [ex.submit(run, b) for b in batches]:
                 f.result()
+        for j, v in enumerate(out):
+            if v:
+                result[idx[j]] = v
+            else:
+                self.missed += 1
         return result
 
 
@@ -364,11 +413,15 @@ class GoogleTranslator(BaseTranslator):
         return out
 
 
-def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300):
-    """Один запрос к OpenRouter. Возвращает текст ответа модели."""
+def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300, usage=None):
+    """Один запрос к OpenRouter. Возвращает текст ответа модели; расход пишет в usage (Usage)."""
     if not api_key:
         raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
-    payload = json.dumps({"model": model, "temperature": temperature, "messages": messages}).encode()
+    body = {"model": model, "temperature": temperature, "messages": messages, "usage": {"include": True}}
+    provider = os.environ.get("OPENROUTER_PROVIDER", "").strip()
+    if provider:  # закрепить провайдера, у которого работает кэширование промпта
+        body["provider"] = {"order": [p.strip() for p in provider.split(",") if p.strip()], "allow_fallbacks": True}
+    payload = json.dumps(body).encode()
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
                "HTTP-Referer": "https://github.com/", "X-Title": "book2epub"}
     try:
@@ -382,45 +435,39 @@ def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300):
         if e.code in (400, 404):
             raise FatalError(f"OpenRouter отклонил запрос (проверьте модель «{model}»): {msg}") from None
         raise RuntimeError(f"HTTP {e.code}: {msg}") from None
+    if usage is not None and data.get("usage"):
+        usage.add(data["usage"])
     if data.get("error"):
         raise RuntimeError(data["error"].get("message", "ошибка модели"))
     return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
 
 
-TRANSLATOR_PROMPT = """Ты профессиональный литературный переводчик с китайского языка на русский. \
-Переводи художественно, точно и естественно для русского читателя, сохраняя стиль, тон, диалоги и смысл оригинала.
+TRANSLATOR_PROMPT = """Ты литературный переводчик с китайского на русский. Переводи художественно, точно и \
+естественно, сохраняя стиль, тон, диалоги и смысл.
 
 Точность:
-1. Ничего не добавляй от себя и ничего не пропускай: жесты, взгляды, паузы, оттенки чувств, детали обстановки должны остаться.
-2. Сохраняй образы и сравнения оригинала и их порядок (水火 — «вода и огонь», а не «огонь и вода»). Не подменяй образ другим.
-3. Многозначные слова переводи по контексту, а не по первому словарному значению: 性 в описании характера — «нрав», \
-阅 — «читать», 评注 — «отзыв». Не разбирай устойчивые слова на части (浮生 — «бренная жизнь»).
-4. Сохраняй реалии эпохи: кисть и тушь (не перо и чернила), свиток, жалованье. Не вводи современные и европейские реалии.
-5. Кто действует и к кому обращено действие — строго как в оригинале. Род и число согласуй по справке о персонажах.
-6. Надписи, указы, письма, стихи и запреты переводи с сохранением каждого значимого слова.
-7. Передавай тон словами: нахальство, холодность, иронию, просторечие, архаику.
+- Ничего не добавляй и не пропускай: жесты, взгляды, паузы, оттенки чувств, детали обстановки.
+- Сохраняй образы, сравнения и их порядок (水火 — «вода и огонь»), не подменяй образ другим.
+- Многозначные слова — по контексту, устойчивые слова не разбирай на части (浮生 — «бренная жизнь»).
+- Реалии эпохи (кисть и тушь, свиток), без современных и европейских реалий.
+- Кто действует и к кому обращено действие — строго как в оригинале; род и число — по справке о персонажах.
+- Надписи, указы, письма, стихи — с каждым значимым словом. Тон (ирония, просторечие, архаика) передавай словами.
 
 Оформление:
-- Прямая речь — по-русски, через тире: «— Реплика, — сказал он. — Продолжение». После слов автора с двоеточием: «Он сказал: — Реплика».
-- Китайские кавычки “” 「」 в прямой речи заменяй тире; в цитатах и названиях — кавычки-«ёлочки». «……» → «…»; \
-реплика из одного многоточия — «— …».
-- Имена, фамилии и топонимы — по системе Палладия, кириллицей, единообразно во всём тексте; имена из глоссария — строго как в глоссарии.
-- Не добавляй комментариев, пояснений и транслитерации в скобках внутри текста.
+- Прямая речь через тире: «— Реплика, — сказал он. — Продолжение». После двоеточия: «Он сказал: — Реплика».
+- “” 「」 в речи → тире; в цитатах и названиях → «ёлочки». «……» → «…»; реплика из многоточия → «— …».
+- Имена и топонимы — по Палладию, единообразно; имена из глоссария — строго как в глоссарии.
+- Никаких комментариев и транслитерации в скобках.
 
-Формат: каждый фрагмент начинается с метки вида ⟦N⟧. Верни перевод каждого фрагмента, начиная его с той же метки, \
-в том же порядке. Не пропускай, не объединяй и не разбивай фрагменты. Не выводи ничего, кроме фрагментов с метками. \
-Абзацы под заголовком «Контекст» не переводи и не выводи: они нужны только для понимания."""
+Формат: каждый фрагмент начинается с метки ⟦N⟧. Верни перевод каждого фрагмента с той же меткой, в том же порядке, \
+не объединяя и не разбивая. Больше ничего не выводи. Абзацы под заголовком «Контекст» и строки «Глоссарий» \
+не переводи и не выводи."""
 
-NOTES_PROMPT = """Сноски:
-Распознавай в оригинале чэнъюи (成语) и другие устойчивые выражения, метафоры, аллюзии на историю, литературу, \
-философию и мифологию, игру слов и культурные реалии, смысл которых русский читатель без пояснения не поймёт \
-или поймёт неверно. В тексте переводи такое выражение художественно, как обычно, а сразу после него ставь метку [^1] \
-(в пределах фрагмента нумеруй 1, 2, 3…). После текста фрагмента, каждую с новой строки, пиши саму сноску:
-[^1]: 金枝玉叶 (jīn zhī yù yè). Дословно: «золотая ветвь, нефритовые листья». Древнее выражение о человеке высокого \
-происхождения, драгоценном и благородном, которого нельзя равнять с простыми людьми.
-Сноска: иероглифы ровно как в оригинале, пиньинь с тонами, дословный перевод, затем 1–3 предложения о настоящем \
-смысле, происхождении и оттенке (ирония, почтение, грубость). Не делай сносок на обычные слова, имена персонажей \
-и очевидные сравнения. Обычно в абзаце сносок нет; больше двух на абзац — только если без них не обойтись."""
+NOTES_PROMPT = """Сноски: к чэнъюям, аллюзиям, игре слов и реалиям, которые русский читатель без пояснения не поймёт, \
+ставь после выражения метку [^1] (нумерация внутри фрагмента), а после текста фрагмента с новой строки — сноску:
+[^1]: 金枝玉叶 (jīn zhī yù yè). Дословно: «золотая ветвь, нефритовые листья». О человеке знатного происхождения.
+Иероглифы ровно как в оригинале, пиньинь, дословно, одно предложение о смысле. Не больше одной сноски на абзац; \
+обычные слова, имена и очевидные сравнения не поясняй; повторно одно выражение не поясняй."""
 
 NOTE_REF = re.compile(r"\[\^(\d+)\]")
 NOTE_DEF = re.compile(r"^[ \t]*\[\^(\d+)\]:[ \t]*(.+?)[ \t]*$", re.M)
@@ -438,28 +485,51 @@ def strip_notes(text):
 
 
 class OpenRouterTranslator(BaseTranslator):
-    """Перевод через OpenRouter (по умолчанию DeepSeek) с метками ⟦N⟧ у фрагментов."""
-    name = "openrouter"
-    max_chars, max_items, workers = 1800, 40, 3
-    context_items = 3
+    """Перевод через OpenRouter (по умолчанию DeepSeek) с метками ⟦N⟧ у фрагментов.
 
-    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True):
+    Системный промпт одинаков для всех запросов книги (провайдер кэширует его и берёт дешевле),
+    а глоссарий идёт в запрос только теми строками, что встречаются в этом пакете."""
+    name = "openrouter"
+    max_chars, max_items, workers = 5000, 120, 8
+    context_items = 2
+
+    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True,
+                 budget=None):
         super().__init__(cache)
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
         self.api_key, self.model = api_key, model or DEFAULT_MODEL
+        self.usage, self.budget = Usage(), budget
         self.system = TRANSLATOR_PROMPT + "\n\n" + (NOTES_PROMPT if notes else "Сносок не делай.")
         if book_title:
             self.system += f"\n\nКнига: «{book_title}»" + (f" (по-русски: «{card['title_ru']}»)"
                                                           if card and card.get("title_ru") else "") + "."
         if card:
             self.system += "\n\n" + card_brief(card)
-        gl = merge_glossary(card_glossary(card) if card else "", glossary)
-        if gl:
-            self.system += "\n\nОбязательный глоссарий (оригинал = перевод):\n" + gl
+        full = merge_glossary(card_glossary(card) if card else "", glossary)
+        self.glossary = parse_glossary(full)
+        self.glossary_text = full
+        try:
+            import legacy_prompts as old
+            self.legacy = ("tr:" + hashlib.sha1(f"openrouter:{self.model}:{old.system(book_title, card, full, notes)}"
+                                                .encode()).hexdigest()[:12], old.MAX_CHARS, old.MAX_ITEMS)
+        except ImportError:
+            self.legacy = None
 
     def cache_prefix(self):
-        return f"openrouter:{self.model}:{self.system}"
+        return f"openrouter:v2:{self.model}:{self.system}\n{self.glossary_text}"
+
+    def legacy_lookup(self, todo, out):
+        if not self.legacy:
+            return
+        prefix, max_chars, max_items = self.legacy
+        for g in make_batches(todo, max_chars, max_items):
+            part = [todo[i] for i in g]
+            v = self.cache.get(prefix + ":" + hashlib.sha1("\u0001".join(part).encode()).hexdigest())
+            if isinstance(v, list) and len(v) == len(part):
+                for i, t in zip(g, v):
+                    if t and not out[i]:
+                        out[i] = t
 
     def passthrough(self, text):
         # Реплика-молчание “……” → «— …», китайское многоточие → русское.
@@ -468,34 +538,45 @@ class OpenRouterTranslator(BaseTranslator):
         return "— " + m.group(1).replace("！", "!").replace("？", "?") if m else t
 
     def _call(self, texts, context=()):
+        joined = "".join(texts) + "".join(context)
+        gl = [f"{k} = {v}" for k, v in self.glossary.items() if k in joined]
         body = ""
+        if gl:
+            body += "Глоссарий для этого отрывка (оригинал = перевод):\n" + "\n".join(gl) + "\n\n"
         if context:
-            body = "Контекст (предыдущие абзацы, не переводить):\n" + "\n".join(context) + "\n\nПереведи:\n"
+            body += "Контекст (предыдущие абзацы, не переводить):\n" + "\n".join(context) + "\n\n"
+        if body:
+            body += "Переведи:\n"
         body += "\n\n".join(f"⟦{i + 1}⟧ {t}" for i, t in enumerate(texts))
         out = openrouter_chat(self.api_key, self.model,
-                              [{"role": "system", "content": self.system}, {"role": "user", "content": body}])
+                              [{"role": "system", "content": self.system}, {"role": "user", "content": body}],
+                              usage=self.usage)
+        if self.budget and self.usage.cost >= self.budget and not self.stop_reason:
+            self.stop_reason = f"достигнут лимит расходов ${self.budget:g}"
         parts = {int(n): t.strip() for n, t in re.findall(r"⟦(\d+)⟧\s*(.*?)(?=⟦\d+⟧|\Z)", out, re.S)}
         return [parts.get(i + 1) for i in range(len(texts))]
 
     def _batch(self, texts, context=()):
         last, incomplete = None, False
         for attempt in range(5):
+            if self.stop_reason:
+                return [None] * len(texts)
             try:
                 res = self._call(texts, context)
                 if all(res):
                     return res
                 last, incomplete = "модель вернула не все фрагменты", True
                 if len(texts) > 1:
-                    break  # делим пакет пополам — так модель реже сбивается
+                    # делим пакет пополам — так модель реже сбивается; готовые фрагменты не теряем
+                    mid = (len(texts) + 1) // 2
+                    a = res[:mid] if all(res[:mid]) else self._batch(texts[:mid], context)
+                    b = res[mid:] if all(res[mid:]) else self._batch(texts[mid:], texts[:mid][-self.context_items:])
+                    return a + b
             except FatalError:
                 raise
             except Exception as e:  # noqa: BLE001 — сеть/перегрузка: ждём и повторяем
                 last, incomplete = e, False
             time.sleep(min(30, 2 * 2 ** attempt))
-        if incomplete and len(texts) > 1:
-            mid = (len(texts) + 1) // 2
-            first = texts[:mid]
-            return self._batch(first, context) + self._batch(texts[mid:], first[-self.context_items:])
         print(f"  не переведено фрагментов: {len(texts)} ({last})", file=sys.stderr)
         return [None] * len(texts)
 
@@ -637,7 +718,8 @@ def card_brief(card):
     if card.get("genre"):
         lines.append(f"Жанр: {card['genre']}.")
     if card.get("synopsis"):
-        lines.append(f"Сюжет: {card['synopsis']}")
+        syn = card["synopsis"]
+        lines.append("Сюжет: " + (syn if len(syn) <= 500 else syn[:500].rsplit(" ", 1)[0] + "…"))
     if card.get("characters"):
         lines.append("Персонажи:")
         for c in card["characters"]:

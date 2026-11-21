@@ -100,12 +100,8 @@ def bar(done, total, width=12):
     return "▓" * filled + "░" * (width - filled) + f" {done}/{total}"
 
 
-def cached_part(book, tr, mode):
-    """Только то, что уже переведено и лежит в кэше: к модели не обращаемся.
-    В книгу идут главы с начала, переведённые целиком; на первой непереведённой книга обрывается."""
-    tr._batch = lambda texts, context=(): [None] * len(texts)
-    orig = [list(ch["paras"]) for ch in book["chapters"]]
-    b2e.translate_book(book, tr, bilingual=(mode == "bi"))
+def trim_to_translated(book, orig, reason):
+    """Оставляет главы с начала, переведённые целиком; на первой непереведённой книга обрывается."""
     keep = []
     for ch, src in zip(book["chapters"], orig):
         if any(b2e.HAN.search(o) and t == o for o, t in zip(src, ch["paras"])):
@@ -113,10 +109,13 @@ def cached_part(book, tr, mode):
         keep.append(ch)
     total = len(book["chapters"])
     book["chapters"] = keep
-    book["partial_note"] = f"Готовая часть перевода: глав {len(keep)} из {total}"
+    book["partial_note"] = f"{reason}: глав {len(keep)} из {total}"
     if not keep:
-        raise b2e.FatalError("В кэше нет ни одной полностью переведённой главы.")
-    return 0
+        raise b2e.FatalError(f"{reason}: нет ни одной полностью переведённой главы.")
+
+
+def money(x):
+    return f"${x:.2f}" if x >= 0.01 else f"${x:.4f}"
 
 
 def main():
@@ -170,18 +169,55 @@ def main():
     if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
     book["card"] = card
+    if str(P.get("from") or "").isdigit():  # для проверки: начать с главы N (вместе с limit — отрезок книги)
+        book["chapters"] = book["chapters"][int(P["from"]) - 1:]
 
     orig_title, n = book["title"], len(book["chapters"])
     status(f"📚 «{orig_title}» — глав: {n}", force=True)
 
-    missed, lang = 0, "zh"
+    missed, lang, usage_note = 0, "zh", ""
     if mode in ("ru", "bi"):
+        budget = str(P.get("budget") or os.environ.get("TRANSLATE_BUDGET_USD") or "").strip().lstrip("$")
         tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
-                                      notes=P.get("notes") is not False)
+                                      notes=P.get("notes") is not False,
+                                      budget=float(budget) if budget.replace(".", "", 1).isdigit() else None)
+        orig = [list(ch["paras"]) for ch in book["chapters"]]
+        if P.get("cached_only"):  # только то, что уже есть в кэше: к модели не обращаемся
+            tr._batch = lambda texts, context=(): [None] * len(texts)
+        t0 = [0.0]
+
+        def plan(total, cached, chars):
+            t0[0] = time.time()
+            if P.get("cached_only"):
+                return
+            left = total - cached
+            msg = f"📊 Абзацев: {total}, уже переведено раньше: {cached}, осталось: {left} (~{chars // 1000} тыс. иероглифов)."
+            if left:
+                msg += f"\nЗапросов к модели: ~{max(1, chars // tr.max_chars + 1)}. Стоимость покажу после первых ответов."
+            if tr.budget:
+                msg += f"\nЛимит расходов: ${tr.budget:g} — дойдя до него, пришлю готовую часть."
+            send_text(msg)
+
+        def tprogress(stage, done, total):
+            if stage != "translate":
+                return progress(stage, done, total)
+            u, lines = tr.usage, [f"🈯 Перевожу\n{bar(done, total)}"]
+            if u.calls and done:
+                share = done / total
+                mins = (time.time() - t0[0]) / share * (1 - share) / 60
+                lines.append(f"💰 {money(u.cost)} · на всё ≈{money(u.cost / share)} · осталось ≈{mins:.0f} мин")
+            status("\n".join(lines), force=done == total)
+
+        tr.on_plan = plan
+        missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=tprogress)
+        print("OpenRouter:", tr.usage.summary(), file=sys.stderr)
         if P.get("cached_only"):
-            missed = cached_part(book, tr, mode)
-        else:
-            missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
+            trim_to_translated(book, orig, "Готовая часть перевода")
+            missed = 0
+        elif tr.stop_reason:
+            trim_to_translated(book, orig, f"Остановлено ({tr.stop_reason}), пришлите ещё раз — продолжу")
+            missed = 0
+        usage_note = tr.usage.summary() if tr.usage.calls else ""
         lang = "ru"
 
     status("📦 Собираю EPUB…", force=True)
@@ -197,6 +233,9 @@ def main():
         notes.append(f"⚠️ не переведено фрагментов: {missed} (пришлите задачу ещё раз — допереведу)")
     if book.get("partial_note"):
         notes.append("✂️ " + book["partial_note"])
+    if usage_note:
+        notes.append("💰 " + usage_note)
+    n = len(book["chapters"])
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
     if notes:
         caption += "\n" + "\n".join(notes)
