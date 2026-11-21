@@ -4,7 +4,8 @@
 при необходимости переводит через OpenRouter и отправляет EPUB в Telegram.
 
 Параметры берутся из client_payload события repository_dispatch (для локальной проверки — из PAYLOAD):
-  chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary
+  chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary,
+  save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
 """
 import json
 import os
@@ -60,6 +61,22 @@ def send_document(path, filename, caption):
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.loads(r.read())
+
+
+def save_to_library(file_id, **info):
+    """Сообщает воркеру о готовом файле: при повторном запросе бот отдаст его сразу."""
+    save = P.get("save") or {}
+    if not (save.get("url") and save.get("key") and file_id):
+        return False
+    body = json.dumps({"key": save["key"], "sig": save.get("sig", ""), "file_id": file_id, **info}).encode()
+    req = urllib.request.Request(save["url"], data=body, headers={"Content-Type": "application/json",
+                                                                 "User-Agent": "book-epub-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception as e:  # noqa: BLE001 — книга уже отправлена, библиотека не обязательна
+        print(f"Библиотека: {getattr(e, 'code', '')} {type(e).__name__}", file=sys.stderr)
+        return False
 
 
 def send_text(text):
@@ -169,8 +186,14 @@ def main():
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
     if notes:
         caption += "\n" + "\n".join(notes)
-    send_document(out, name, caption[:1000])
-    status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if notes else ""), force=True)
+    sent = send_document(out, name, caption[:1000])
+    saved = False
+    if not notes:  # неполную книгу не сохраняем: повтор её допереведёт
+        doc = ((sent or {}).get("result") or {}).get("document") or {}
+        saved = save_to_library(doc.get("file_id"), title=book["title"], orig_title=orig_title, mode=mode,
+                                chapters=n, caption=caption[:1000])
+    status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if notes else "")
+           + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 
 
 if __name__ == "__main__":
