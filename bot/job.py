@@ -62,6 +62,18 @@ def send_document(path, filename, caption):
         return json.loads(r.read())
 
 
+def send_text(text):
+    """Отправляет длинный текст несколькими сообщениями (лимит Telegram — 4096 символов)."""
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3900:
+            tg("sendMessage", chat_id=CHAT, text=chunk)
+            chunk = ""
+        chunk += line[:3900] + "\n"
+    if chunk.strip():
+        tg("sendMessage", chat_id=CHAT, text=chunk)
+
+
 _last = {"t": 0.0, "text": ""}
 
 
@@ -95,6 +107,10 @@ def main():
         status(f"{label}\n{bar(done, total)}", force=done == total)
 
     status("⚙️ Начинаю…", force=True)
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    model = os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL
+    glossary = P.get("glossary") or ""
+
     if P.get("file_id"):
         info = tg("getFile", file_id=P["file_id"])
         if not info or not info.get("file_path"):
@@ -105,18 +121,37 @@ def main():
             f.write(r.read())
         book = b2e.load_from_epub(src, limit)
         book["source"] = P.get("file_name") or "book.epub"
+        head = book
     else:
-        status("📖 Читаю оглавление…", force=True)
+        status("📖 Читаю начало книги…", force=True)
+        # Сначала только первые главы — для справки; потом они возьмутся из кэша.
+        head = b2e.load_from_site(P["url"], cache, min(limit or 3, 3))
+
+    # Справка о книге: русское название, о чём она, персонажи. Приходит сразу, до перевода.
+    card = None
+    if api_key:
+        status("🔎 Составляю справку о книге…", force=True)
+        try:
+            card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
+            send_text(b2e.format_card(card, head["title"], head.get("author", "")))
+        except b2e.FatalError:
+            if mode != "orig":
+                raise
+        except Exception as e:  # noqa: BLE001 — без справки книга всё равно соберётся
+            print(f"Справка: {type(e).__name__}: {e}", file=sys.stderr)
+            send_text("⚠️ Справку о книге составить не удалось, перевожу без неё.")
+
+    if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
+    book["card"] = card
 
     orig_title, n = book["title"], len(book["chapters"])
     status(f"📚 «{orig_title}» — глав: {n}", force=True)
 
     missed, lang = 0, "zh"
     if mode in ("ru", "bi"):
-        tr = b2e.OpenRouterTranslator(cache, os.environ.get("OPENROUTER_API_KEY", ""),
-                                      os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL,
-                                      orig_title, P.get("glossary") or "")
+        tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
+                                      notes=P.get("notes") is not False)
         missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
         lang = "ru"
 
