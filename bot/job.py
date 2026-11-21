@@ -5,6 +5,7 @@
 
 Параметры берутся из client_payload события repository_dispatch (для локальной проверки — из PAYLOAD):
   chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary,
+  edit — {title, cover, thumb}: своё название книги и обложка (file_id картинки и её уменьшенной копии в Telegram),
   save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
 Режим "describe": ничего не собирает, а составляет описание загруженного EPUB (название, автор, жанр,
 о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
@@ -54,16 +55,22 @@ def tg(method, **params):
         return None
 
 
-def send_document(path, filename, caption):
+def send_document(path, filename, caption, thumb=None):
     boundary = uuid.uuid4().hex
     parts = []
-    for k, v in (("chat_id", str(CHAT)), ("caption", caption)):
+    fields = [("chat_id", str(CHAT)), ("caption", caption)]
+    if thumb:  # значок файла: Telegram принимает только новый JPEG до 320×320 и 200 КБ
+        fields.append(("thumbnail", "attach://thumb"))
+    for k, v in fields:
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
     with open(path, "rb") as f:
         data = f.read()
     fn = filename.replace('"', "")
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{fn}"\r\n'
                   f"Content-Type: application/epub+zip\r\n\r\n").encode() + data + b"\r\n")
+    if thumb:
+        parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="thumb"; filename="thumb.jpg"\r\n'
+                      f"Content-Type: image/jpeg\r\n\r\n").encode() + thumb + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
     req = urllib.request.Request(f"{TG_API}/bot{TOKEN}/sendDocument", data=b"".join(parts),
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
@@ -137,15 +144,38 @@ def money(x):
     return f"${x:.2f}" if x >= 0.01 else f"${x:.4f}"
 
 
-def download_epub(tmp):
-    info = tg("getFile", file_id=P["file_id"])
+def download(file_id, max_bytes=20 * 1024 * 1024):
+    """Скачивает файл, присланный боту, по его file_id."""
+    info = tg("getFile", file_id=file_id)
     if not info or not info.get("file_path"):
         raise b2e.FatalError("Telegram не отдал файл (бот может скачивать файлы до 20 МБ).")
+    with urllib.request.urlopen(f"{TG_API}/file/bot{TOKEN}/{info['file_path']}", timeout=120) as r:
+        return r.read(max_bytes + 1)
+
+
+def download_epub(tmp):
     src = os.path.join(tmp, "in.epub")
-    with urllib.request.urlopen(f"{TG_API}/file/bot{TOKEN}/{info['file_path']}", timeout=120) as r, \
-            open(src, "wb") as f:
-        f.write(r.read())
+    with open(src, "wb") as f:
+        f.write(download(P["file_id"]))
     return src
+
+
+def user_cover(edit):
+    """Своя обложка из меню «✏️ Изменить»: ((байты, тип), значок JPEG или None) или (None, None)."""
+    if not edit.get("cover"):
+        return None, None
+    try:
+        data = download(edit["cover"])
+        mtype = b2e.image_type(data)
+        if not mtype:
+            send_text("⚠️ Обложка не похожа на картинку JPG/PNG — собираю без неё.")
+            return None, None
+        thumb = download(edit["thumb"], 200 * 1024) if edit.get("thumb") else None
+        return (data, mtype), thumb
+    except Exception as e:  # noqa: BLE001 — без своей обложки книга всё равно соберётся
+        print(f"Обложка: {type(e).__name__}: {e}", file=sys.stderr)
+        send_text("⚠️ Не удалось скачать обложку — собираю без неё.")
+        return None, None
 
 
 def post_json(url, body):
@@ -212,6 +242,8 @@ def main():
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL
     glossary = P.get("glossary") or ""
+    edit = P.get("edit") if isinstance(P.get("edit"), dict) else {}
+    cover, thumb = user_cover(edit)
 
     if P.get("file_id"):
         book = b2e.load_from_epub(download_epub(tmp), limit)
@@ -222,12 +254,18 @@ def main():
         # Сначала только первые главы — для справки; потом они возьмутся из кэша.
         head = b2e.load_from_site(P["url"], cache, min(limit or 3, 3))
 
+    # Своё название: из меню «✏️ Изменить» или строкой глоссария «原题 = Русское название».
+    title = str(edit.get("title") or "").strip()[:200] or b2e.parse_glossary(glossary).get(head["title"], "")
+
     # Справка о книге: русское название, о чём она, персонажи. Приходит сразу, до перевода.
-    card = None
+    card = tr_card = None
     if api_key:
         status("🔎 Составляю справку о книге…", force=True)
         try:
-            card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
+            tr_card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
+            # Переводчику — справка как есть (её текст входит в ключ кэша переводов), а своё название он
+            # получит отдельно; в справку для читателя и в её глоссарий — своё название.
+            card = b2e.apply_title(tr_card, head["title"], title) if title else tr_card
             if not P.get("cached_only"):
                 send_text(b2e.format_card(card, head["title"], head.get("author", "")))
         except b2e.FatalError:
@@ -240,6 +278,8 @@ def main():
     if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
     book["card"] = card
+    if cover:
+        book["cover"] = cover
     if str(P.get("from") or "").isdigit():  # для проверки: начать с главы N (вместе с limit — отрезок книги)
         book["chapters"] = book["chapters"][int(P["from"]) - 1:]
 
@@ -249,9 +289,10 @@ def main():
     missed, lang, usage_note = 0, "zh", ""
     if mode in ("ru", "bi"):
         budget = str(P.get("budget") or os.environ.get("TRANSLATE_BUDGET_USD") or "").strip().lstrip("$")
-        tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
+        tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, tr_card,
                                       notes=P.get("notes") is not False,
-                                      budget=float(budget) if budget.replace(".", "", 1).isdigit() else None)
+                                      budget=float(budget) if budget.replace(".", "", 1).isdigit() else None,
+                                      title=title or None)
         orig = [list(ch["paras"]) for ch in book["chapters"]]
         if P.get("cached_only"):  # только то, что уже есть в кэше: к модели не обращаемся
             tr._batch = lambda texts, context=(): [None] * len(texts)
@@ -291,9 +332,11 @@ def main():
         usage_note = tr.usage.summary() if tr.usage.calls else ""
         lang = "ru"
 
+    if title:
+        book["orig_title"], book["title"] = orig_title, title
     status("📦 Собираю EPUB…", force=True)
     suffix = {"orig": "", "ru": "_ru", "bi": "_zh-ru"}[mode]
-    name = b2e.safe_filename((book["title"] if mode != "orig" else orig_title)) + suffix + ".epub"
+    name = b2e.safe_filename(book["title"]) + suffix + ".epub"
     # Длинная книга (больше 140 тыс. знаков китайского текста) делится на несколько томов.
     parts = b2e.split_book(book, int(os.environ.get("MAX_PART_CHARS") or b2e.MAX_PART_CHARS), lang)
     outs = []
@@ -334,9 +377,11 @@ def main():
         with open(os.path.join(os.environ["OUT_DIR"], "caption.txt"), "w", encoding="utf-8") as f:
             f.write(caption)
         return
+    if book.get("cover") and not thumb:
+        thumb = b2e.make_thumbnail(book["cover"][0])
     file_ids = []
     for k, (out, fname, part) in enumerate(outs, 1):
-        sent = send_document(out, fname, part_caption(k, part)[:1000])
+        sent = send_document(out, fname, part_caption(k, part)[:1000], thumb)
         file_ids.append((((sent or {}).get("result") or {}).get("document") or {}).get("file_id"))
     saved = False
     # Неполную книгу не сохраняем: повторный запрос её допереведёт.
@@ -345,11 +390,12 @@ def main():
         c = card or {}
         # Без строки о расходах: при повторной выдаче из библиотеки за перевод уже не платят.
         lib_caption = "\n".join(x for x in caption.split("\n") if not x.startswith("💰"))
-        names = [c.get(k) for k in ("title_ru", "title_literal", "title_en", "title_pinyin", "author_ru")]
+        names = [c.get(k) for k in ("title_ru", "title_ai", "title_literal", "title_en", "title_pinyin", "author_ru")]
         names.append(book.get("author") or head.get("author"))
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
-        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes") if k in P}
+        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes", "edit")
+                   if k in P}
         # Справка для карточки книги в мини-приложении.
         info = {"author": c.get("author_ru") or book.get("author") or head.get("author"),
                 "orig_author": book.get("orig_author") or head.get("author"), "genre": c.get("genre"),

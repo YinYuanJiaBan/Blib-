@@ -19,6 +19,10 @@ const HELP =
   "• число — сколько первых глав взять, например: 3\n" +
   "• глоссарий имён, по строке на имя: 顾茫 = Гу Ман\n" +
   "• «без сносок» — не пояснять идиомы и метафоры\n\n" +
+  "Перед сборкой я спрошу, хотите ли вы внести изменения: можно задать своё название книги " +
+  "(например, «Остатки грязи» вместо дословного «Остатки скверны») и свою обложку. " +
+  "Своё название попадёт в справку о книге и в глоссарий перевода, обложка — в EPUB и в библиотеку. " +
+  "Ещё можно прислать картинку с подписью-ссылкой: картинка станет обложкой.\n\n" +
   "В переводе идиомы (成语), метафоры и аллюзии получают сноски: иероглифы, пиньинь, " +
   "дословный перевод и настоящий смысл. В книге сноска открывается нажатием на номер.\n\n" +
   "Сначала придёт справка о книге: русское название, о чём она, персонажи и термины. " +
@@ -150,7 +154,18 @@ async function onMessage(env, msg) {
   }
   if (text.startsWith("/upload")) return toggleUpload(env, chat);
 
-  const doc = msg.document;
+  // Ответ на вопрос бота «напишите название» / «пришлите обложку».
+  const r = msg.reply_to_message;
+  if (env.BOOKS && r && r.from && r.from.is_bot && PROMPT.test(r.text || "")) return onEditReply(env, msg, r);
+
+  const req = parseRequest(text);
+  const image = pickImage(msg);
+  if (image && !req.link) {
+    return say(env, chat, "🖼 Чтобы сделать картинку обложкой, нажмите «🖼 Обложка» в меню изменений книги " +
+      "и пришлите её ответом на моё сообщение. Или пришлите картинку с подписью — ссылкой на книгу.");
+  }
+
+  const doc = image ? null : msg.document;
   if (doc) {
     if (!/\.epub$/i.test(doc.file_name || "")) return say(env, chat, "Я понимаю только файлы .epub.");
     // Режим загрузки (/upload) или подпись «в библиотеку» — сразу сохраняем, ничего не спрашивая.
@@ -159,13 +174,25 @@ async function onMessage(env, msg) {
     const big = doc.file_size > 20 * 1024 * 1024;
     if (big && !env.BOOKS) return say(env, chat, "Файл больше 20 МБ, Telegram не даст боту его скачать.");
     const modes = big ? ["lib"] : env.BOOKS ? ["ru", "bi", "lib"] : ["ru", "bi"];
+    if (env.BOOKS && !big) {
+      const src = { file_id: doc.file_id, file_name: doc.file_name || "book.epub",
+        uid: doc.file_unique_id || doc.file_id, size: doc.file_size || 0 };
+      return offerEdits(env, msg, { src, req, modes }, "📘 " + (doc.file_name || "EPUB"));
+    }
     return ask(env, msg, modes, "Что сделать с этим EPUB?" +
       (big ? "\nФайл больше 20 МБ: перевести его не получится, но в библиотеку сохранить можно." : ""));
   }
 
-  const req = parseRequest(text);
-  if (req.link) return ask(env, msg, ["orig", "ru", "bi"], "Как собрать книгу?" +
-    (req.limit ? `\nГлав: первые ${req.limit}` : "") + (req.notes ? "" : "\nБез сносок") + (req.glossary ? `\nСтрок в глоссарии: ${req.glossary.split("\n").length}` : ""));
+  if (req.link) {
+    const info = (req.limit ? `\nГлав: первые ${req.limit}` : "") + (req.notes ? "" : "\nБез сносок") +
+      (req.glossary ? `\nСтрок в глоссарии: ${req.glossary.split("\n").length}` : "");
+    if (env.BOOKS) {
+      const draft = { src: { url: req.link }, req, modes: ["orig", "ru", "bi"] };
+      if (image) Object.assign(draft, image);
+      return offerEdits(env, msg, draft, "🔗 Книга по ссылке" + info);
+    }
+    return ask(env, msg, ["orig", "ru", "bi"], "Как собрать книгу?" + info);
+  }
 
   // Без ссылки — ищем книгу в библиотеке по названию или автору.
   if (text && !text.startsWith("/")) return findBooks(env, chat, text);
@@ -183,8 +210,62 @@ function ask(env, msg, modes, text) {
 async function onCallback(env, cq) {
   const done = (text) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text });
   if (!allowed(env, cq.from.id)) return done("🔒 Это личный бот");
-  const [action, arg] = (cq.data || "").split(":");
+  const [action, arg, extra] = (cq.data || "").split(":");
   const msg = cq.message;
+
+  // Меню изменений перед сборкой (черновик задачи лежит в KV).
+  if (["ed", "nx", "et", "ec", "ex"].includes(action) || (action === "go" && extra)) {
+    const id = action === "go" ? extra : arg;
+    const draft = env.BOOKS && await env.BOOKS.get("draft:" + id, "json");
+    if (!draft) return done("Меню устарело — пришлите книгу ещё раз");
+    const edit = (text, buttons) => tg(env, "editMessageText", { chat_id: msg.chat.id, message_id: msg.message_id,
+      text, reply_markup: { inline_keyboard: buttons } });
+    if (action === "ed") {
+      await edit(editText(draft), editButtons(id, draft));
+      return done();
+    }
+    if (action === "ex") {
+      const next = { ...draft, cover: null, thumb: null };
+      await edit(editText(next), editButtons(await saveDraft(env, next), next));
+      return done("Обложка убрана");
+    }
+    if (action === "et" || action === "ec") {
+      const title = action === "et";
+      const p = await say(env, msg.chat.id, title
+        ? "📝 Напишите новое название книги ответом на это сообщение.\nНапример: Остатки грязи\n" +
+          "Оно будет в справке о книге и в глоссарии перевода, на титульной странице, в названии файла и в библиотеке. " +
+          "Чтобы вернуть название от нейросети, ответьте «-»."
+        : "🖼 Пришлите картинку для обложки ответом на это сообщение: фото или файл JPG/PNG.",
+        { reply_markup: { force_reply: true, input_field_placeholder: title ? "Новое название" : "Картинка" } });
+      const pid = p && p.result && p.result.message_id;
+      if (!pid) return done("Не получилось");
+      await env.BOOKS.put(`wait:${msg.chat.id}:${pid}`, JSON.stringify({ draft: id, field: title ? "title" : "cover",
+        menu: msg.message_id }), { expirationTtl: 86400 });
+      return done();
+    }
+    if (action === "nx" && !draft.mode) {
+      // С изменениями «просто сохранить в библиотеку» не подходит: книгу надо собрать заново.
+      const modes = draft.title || draft.cover ? draft.modes.filter((m) => m !== "lib") : draft.modes;
+      await edit(modesText(draft), modes.map((m) => [{ text: BUTTONS[m], callback_data: `go:${m}:${id}` }]));
+      return done();
+    }
+    const mode = action === "go" ? arg : draft.mode;
+    if (!BUTTONS[mode]) return done("Неизвестная команда");
+    if (mode === "lib") {
+      const s = draft.src;
+      await tg(env, "editMessageReplyMarkup", { chat_id: msg.chat.id, message_id: msg.message_id,
+        reply_markup: { inline_keyboard: [] } });
+      await saveUpload(env, msg.chat.id, { file_id: s.file_id, file_unique_id: s.uid, file_name: s.file_name,
+        file_size: s.size || 0 }, null, msg.message_id);
+      return done("Готово");
+    }
+    return done(await startDraft(env, msg, draft, mode) ? "Запущено!" : "Ошибка запуска");
+  }
+  // «✏️ Изменить» под книгой из библиотеки.
+  if (action === "chg") {
+    const r = await editSaved(env, msg.chat.id, arg);
+    return done(r === true ? undefined : r);
+  }
 
   // Книга из списка /library.
   if (action === "get") {
@@ -275,6 +356,140 @@ async function rebuild(env, chat_id, key) {
   return await dispatch(env, chat_id, payload) ? true : "Ошибка запуска";
 }
 
+// Меню изменений для готовой книги: новое название или обложка, перевод берётся из кэша. true или текст ошибки.
+async function editSaved(env, chat_id, key) {
+  const saved = env.BOOKS && await env.BOOKS.get("book:" + key, "json");
+  const q = saved && saved.req;
+  if (!q || !(q.url || q.file_id) || !BUTTONS[q.mode] || q.mode === "lib")
+    return "Эту книгу не собрать заново — пришлите ссылку или файл ещё раз";
+  const src = q.url ? { url: q.url } : { file_id: q.file_id, file_name: q.file_name, uid: q.file_id };
+  const e = q.edit || {};
+  const draft = { src, req: { limit: q.limit || "", glossary: q.glossary || "", notes: q.notes !== false },
+    mode: q.mode, key, label: `${ICONS[q.mode] || "📘"} ${saved.title || saved.orig_title}`,
+    title: e.title || null, cover: e.cover || null, thumb: e.thumb || null };
+  const id = await saveDraft(env, draft);
+  await say(env, chat_id, editText(draft), { reply_markup: { inline_keyboard: editButtons(id, draft) } });
+  return true;
+}
+
+// ---------------------------------------------------------------- изменения перед сборкой
+// Черновик задачи: откуда собирать (src), настройки (req), своё название и обложка.
+// Каждое изменение сохраняется под новым ключом: KV не всегда сразу видит перезапись старого.
+const PROMPT = /^(📝 Напишите новое название|🖼 Пришлите картинку для обложки)/;
+
+async function saveDraft(env, draft) {
+  const id = hex(crypto.getRandomValues(new Uint8Array(8)));
+  await env.BOOKS.put("draft:" + id, JSON.stringify(draft), { expirationTtl: 7 * 86400 });
+  return id;
+}
+
+async function offerEdits(env, msg, draft, label) {
+  const id = await saveDraft(env, { ...draft, label });
+  return say(env, msg.chat.id, `${label}\n\n✏️ Хотите внести изменения — поменять название или обложку?` +
+    (draft.cover ? "\n🖼 Обложка: картинка из вашего сообщения" : ""), {
+    reply_to_message_id: msg.message_id,
+    reply_markup: { inline_keyboard: [[{ text: "✏️ Да, изменить", callback_data: "ed:" + id },
+      { text: "Нет, дальше ➡️", callback_data: "nx:" + id }]] }
+  });
+}
+
+function editText(d) {
+  return `${d.label || "📘 Книга"}\n\n✏️ Изменения\n` +
+    `Название: ${d.title ? `«${d.title}»` : "как предложит нейросеть (или из файла)"}\n` +
+    `Обложка: ${d.cover ? "🖼 своя" : d.src && d.src.file_id ? "из файла, если есть" : "нет"}\n\n` +
+    "Нажмите, что поменять, затем «Готово».";
+}
+
+function editButtons(id, d) {
+  const rows = [[{ text: "📝 Название", callback_data: "et:" + id }, { text: "🖼 Обложка", callback_data: "ec:" + id }]];
+  if (d.cover) rows.push([{ text: "❌ Убрать свою обложку", callback_data: "ex:" + id }]);
+  rows.push([{ text: d.mode ? "✅ Готово — собрать" : "✅ Готово", callback_data: "nx:" + id }]);
+  return rows;
+}
+
+function modesText(d) {
+  const lines = [d.label || "📘 Книга", "", d.src.file_id ? "Что сделать с этим EPUB?" : "Как собрать книгу?"];
+  if (d.title) lines.push(`📝 Название: «${d.title}»`);
+  if (d.cover) lines.push("🖼 Своя обложка");
+  return lines.join("\n");
+}
+
+// Картинка из сообщения (фото или файл-картинка) и её маленькая копия для значка файла.
+function pickImage(msg) {
+  if (Array.isArray(msg.photo) && msg.photo.length) {
+    const small = msg.photo.filter((p) => Math.max(p.width, p.height) <= 320).pop();
+    return { cover: msg.photo[msg.photo.length - 1].file_id, thumb: small ? small.file_id : null };
+  }
+  const d = msg.document;
+  if (d && (/^image\/(jpeg|png|gif|webp)$/i.test(d.mime_type || "") || /\.(jpe?g|png|gif|webp)$/i.test(d.file_name || ""))) {
+    if (d.file_size > 10 * 1024 * 1024) return null;
+    return { cover: d.file_id, thumb: d.thumbnail ? d.thumbnail.file_id : null };
+  }
+  return null;
+}
+
+async function onEditReply(env, msg, prompt) {
+  const chat = msg.chat.id;
+  const wait = await env.BOOKS.get(`wait:${chat}:${prompt.message_id}`, "json");
+  const draft = wait && await env.BOOKS.get("draft:" + wait.draft, "json");
+  if (!draft) return say(env, chat, "Меню устарело — пришлите книгу ещё раз.");
+  const next = { ...draft };
+  if (wait.field === "title") {
+    const t = (msg.text || "").replace(/\s+/g, " ").trim().replace(/^[«"“]+|[»"”]+$/g, "");
+    if (!t) return say(env, chat, "Пришлите название текстом ответом на моё сообщение.");
+    next.title = /^[-—–]$/.test(t) ? null : t.slice(0, 200);
+  } else {
+    const img = pickImage(msg);
+    if (!img) return say(env, chat, "Нужна картинка: фото или файл JPG/PNG до 10 МБ. Пришлите её ответом на моё сообщение.");
+    Object.assign(next, img);
+  }
+  const id = await saveDraft(env, next);
+  // Старое меню гасим, новое присылаем внизу, чтобы не листать чат.
+  await tg(env, "editMessageText", { chat_id: chat, message_id: wait.menu, text: "✏️ Изменения — ниже ⬇️",
+    reply_markup: { inline_keyboard: [] } });
+  const head = wait.field === "title" ? (next.title ? `✅ Название: «${next.title}»` : "✅ Название — от нейросети")
+    : "✅ Обложка сохранена";
+  return say(env, chat, head + "\n\n" + editText(next), {
+    reply_to_message_id: msg.message_id, reply_markup: { inline_keyboard: editButtons(id, next) }
+  });
+}
+
+async function startDraft(env, msg, draft, mode) {
+  const chat = msg.chat.id;
+  const req = { limit: draft.req.limit || "", glossary: draft.req.glossary || "", notes: draft.req.notes !== false };
+  const payload = { chat_id: chat, status_id: msg.message_id, mode };
+  let source;
+  if (draft.src.file_id) {
+    payload.file_id = draft.src.file_id;
+    payload.file_name = draft.src.file_name || "book.epub";
+    source = "tg:" + (draft.src.uid || draft.src.file_id);
+  } else {
+    payload.url = draft.src.url;
+    source = normLink(draft.src.url);
+  }
+  if (req.limit) payload.limit = req.limit;
+  if (req.glossary) payload.glossary = req.glossary;
+  if (!req.notes) payload.notes = false;
+  const edited = !!(draft.title || draft.cover);
+  // В client_payload GitHub — не больше 10 полей, поэтому изменения вложены в одно.
+  if (edited) payload.edit = { title: draft.title || null, cover: draft.cover || null, thumb: draft.thumb || null };
+
+  const key = draft.key || await bookKey(mode, source, req);
+  // Без изменений — отдаём готовую книгу из библиотеки; с изменениями — собираем и заменяем запись.
+  const saved = !edited && !draft.key && await env.BOOKS.get("book:" + key, "json");
+  if (saved) {
+    await tg(env, "editMessageText", { chat_id: chat, message_id: msg.message_id,
+      text: `📚 ${BUTTONS[mode]}: эта книга уже есть в библиотеке, отправляю готовый файл.` });
+    await sendSaved(env, chat, saved, key);
+    return true;
+  }
+  payload.save = { url: ORIGIN + "/saved", key, sig: await sign(env, key) };
+  await tg(env, "editMessageText", { chat_id: chat, message_id: msg.message_id,
+    text: `⏳ ${BUTTONS[mode]}: задача отправлена, запуск займёт до минуты…` +
+      (draft.title ? `\n📝 Название: «${draft.title}»` : "") + (draft.cover ? "\n🖼 Своя обложка" : "") });
+  return dispatch(env, chat, payload);
+}
+
 async function deleteBook(env, key) {
   if (!env.BOOKS) return;
   await Promise.all([env.BOOKS.delete("book:" + key), env.BOOKS.delete("cover:" + key)]);
@@ -325,8 +540,9 @@ async function sign(env, key) {
 }
 
 async function sendSaved(env, chat_id, saved, key) {
-  const row = [{ text: "🗑 Убрать из библиотеки", callback_data: "del:" + key }];
-  if (saved.req) row.unshift({ text: "🔄 Собрать заново", callback_data: "rb:" + key });
+  const rows = [[{ text: "🗑 Убрать из библиотеки", callback_data: "del:" + key }]];
+  if (saved.req && saved.mode !== "lib") rows.unshift([{ text: "🔄 Собрать заново", callback_data: "rb:" + key },
+    { text: "✏️ Изменить", callback_data: "chg:" + key }]);
   const date = saved.date ? `\nСохранено: ${saved.date.slice(0, 10)}` : "";
   // Длинная книга хранится несколькими томами: шлём их по порядку, подпись и кнопки — у последнего.
   const ids = Array.isArray(saved.file_ids) && saved.file_ids.length ? saved.file_ids : [saved.file_id];
@@ -335,7 +551,7 @@ async function sendSaved(env, chat_id, saved, key) {
   }
   const last = ids.length > 1 ? `\n📕 Книга ${ids.length} из ${ids.length}` : "";
   return tg(env, "sendDocument", { chat_id, document: ids[ids.length - 1],
-    caption: (saved.caption || "").slice(0, 940) + last + date, reply_markup: { inline_keyboard: [row] } });
+    caption: (saved.caption || "").slice(0, 940) + last + date, reply_markup: { inline_keyboard: rows } });
 }
 
 // Обрезает строку так, чтобы она заняла не больше n байт UTF-8 (метаданные KV — до 1024 байт).
@@ -715,6 +931,10 @@ async function onApi(env, request, url) {
     const r = await rebuild(env, user.id, key);
     return r === true ? json({ ok: true }) : json({ error: r }, 400);
   }
+  if (route === "edit") {
+    const r = await editSaved(env, user.id, key);
+    return r === true ? json({ ok: true }) : json({ error: r }, 400);
+  }
   if (route === "describe") {
     return await describeBook(env, user.id, key, rec) ? json({ ok: true })
       : json({ error: "Не удалось запустить: проверьте GH_TOKEN и GH_REPO" }, 502);
@@ -1051,7 +1271,8 @@ header.scrolled { border-bottom-color: var(--sep); }
     if (names.length) html += '<div class="sec names"><h3>Другие названия</h3>' +
       names.map(function (n) { return "<div>" + esc(n) + "</div>"; }).join("") + "</div>";
     if (b.d) html += '<div class="sec"><h3>В библиотеке</h3><p>с ' + esc(date(b.d)) + "</p></div>";
-    html += '<div class="actions">' + (d.rebuild ? '<button data-act="rebuild">🔄 Собрать заново</button>' : "") +
+    html += '<div class="actions">' + (d.rebuild ? '<button data-act="edit">✏️ Название и обложка</button>' +
+      '<button data-act="rebuild">🔄 Собрать заново</button>' : "") +
       (d.describe ? '<button data-act="describe">📝 ' + (d.described ? "Составить описание заново" : "Составить описание") + "</button>" : "") +
       '<button class="del" data-act="delete">🗑 Убрать из библиотеки</button></div>';
     return html;
@@ -1117,6 +1338,9 @@ header.scrolled { border-bottom-color: var(--sep); }
     } else if (what === "rebuild") {
       if (!await confirmAsk("Перевести «" + (b.t || b.o) + "» заново? Новый файл заменит этот, перевод снова будет стоить денег.")) return;
       try { await api("/api/rebuild", { k: b.k }); toast("Запущено — прогресс в чате с ботом"); }
+      catch (e) { toast(e.message); }
+    } else if (what === "edit") {
+      try { await api("/api/edit", { k: b.k }); toast("Меню изменений — в чате с ботом"); }
       catch (e) { toast(e.message); }
     } else if (what === "describe") {
       try {

@@ -277,6 +277,29 @@ def load_from_epub(path, limit=None):
 IMAGE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
 
+def image_type(data):
+    """media-type картинки по первым байтам или None, если это не JPEG/PNG/GIF/WebP."""
+    for mtype, magic in (("image/jpeg", b"\xff\xd8\xff"), ("image/png", b"\x89PNG"), ("image/gif", b"GIF8"),
+                         ("image/webp", b"RIFF")):
+        if data and data.startswith(magic) and (mtype != "image/webp" or data[8:12] == b"WEBP"):
+            return mtype
+    return None
+
+
+def make_thumbnail(data, size=320):
+    """Маленькая JPEG-копия обложки (значок файла в Telegram). Нужен Pillow; без него — None."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((size, size))
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=85)
+        return out.getvalue() if out.tell() <= 200 * 1024 else None
+    except Exception:  # noqa: BLE001 — нет Pillow или картинка не читается: обойдёмся без значка
+        return None
+
+
 def _epub_cover(z, opf, base, manifest):
     """Обложка из EPUB: (байты, media-type) или None. EPUB 3 cover-image, EPUB 2 <meta name="cover">."""
     items = [i for i in manifest.values() if i]
@@ -540,7 +563,7 @@ class OpenRouterTranslator(BaseTranslator):
     context_items = 2
 
     def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True,
-                 budget=None):
+                 budget=None, title=None):
         super().__init__(cache)
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
@@ -555,6 +578,10 @@ class OpenRouterTranslator(BaseTranslator):
         full = merge_glossary(card_glossary(card) if card else "", glossary)
         self.glossary = parse_glossary(full)
         self.glossary_text = full
+        if title and book_title:
+            # Своё название книги идёт только в глоссарий пакетов, где оно встречается, но не в ключ кэша:
+            # так смена названия у готовой книги не требует платить за перевод заново.
+            self.glossary[book_title] = title
         try:
             import legacy_prompts as old
             self.legacy = ("tr:" + hashlib.sha1(f"openrouter:{self.model}:{old.system(book_title, card, full, notes)}"
@@ -805,6 +832,19 @@ def apply_user_glossary(card, user):
     return card
 
 
+def apply_title(card, orig_title, title):
+    """Своё русское название книги: в справку и в её список терминов (глоссарий).
+    Возвращает копию справки; название, предложенное нейросетью, остаётся в title_ai."""
+    card = json.loads(json.dumps(card or {}, ensure_ascii=False))
+    if card.get("title_ru") and card["title_ru"] != title:
+        card["title_ai"] = card["title_ru"]
+    card["title_ru"] = title
+    if orig_title and orig_title != title:
+        card["terms"] = [{"zh": orig_title, "ru": title, "note": "название книги"}] + \
+            [t for t in card.get("terms", []) if t.get("zh") != orig_title]
+    return card
+
+
 def card_brief(card):
     """Справка в коротком виде для системного промпта переводчика."""
     lines = ["Справка о книге (для понимания контекста, не переводи её):"]
@@ -826,6 +866,8 @@ def format_card(card, orig_title="", orig_author=""):
     out = ["📚 Справка о книге", ""]
     title = card.get("title_ru") or orig_title
     out.append(f"Название: {title}")
+    if card.get("title_ai"):
+        out.append(f"(ваше название; нейросеть предлагала «{card['title_ai']}»)")
     if orig_title:
         out.append(f"Оригинал: {orig_title}" + (f" ({card['title_pinyin']})" if card.get("title_pinyin") else ""))
     if card.get("title_literal") and card["title_literal"] != title:
@@ -853,7 +895,8 @@ def format_card(card, orig_title="", orig_author=""):
     out += ["", "ℹ️ Справку составила нейросеть " +
             ("по своим знаниям о книге и её первым главам." if card.get("known")
              else "только по первым главам: книгу она не узнала, сюжет описан по началу.") +
-            " Эти имена будут использованы в переводе. Поправить имя: добавьте к ссылке строку «顾茫 = Гу Ман»."]
+            " Эти имена будут использованы в переводе. Поправить имя: добавьте к ссылке строку «顾茫 = Гу Ман»;"
+            " название книги можно поменять кнопкой «✏️ Изменить»."]
     return "\n".join(out)
 
 
@@ -1170,6 +1213,8 @@ def main():
     ap.add_argument("--bilingual", action="store_true", help="с --translate: оригинал над каждым абзацем перевода")
     ap.add_argument("--lang", default="ru", help="язык перевода для Google (по умолчанию ru)")
     ap.add_argument("--limit", type=int, help="взять только первые N глав")
+    ap.add_argument("--title", help="своё название книги (в переводе — вместо предложенного нейросетью)")
+    ap.add_argument("--cover", help="картинка для обложки (JPG, PNG, GIF или WebP)")
     ap.add_argument("--workers", type=int, default=4, help="параллельных загрузок (по умолчанию 4)")
     ap.add_argument("--delay", type=float, default=0.3, help="пауза между запросами к сайту, сек")
     ap.add_argument("--max-chars", type=int, default=MAX_PART_CHARS,
@@ -1193,6 +1238,12 @@ def main():
         print(f"  внимание: не загрузились главы ({len(book['failed'])}): {', '.join(book['failed'][:5])}…")
 
     orig_title = book["title"]
+    if args.cover:
+        with open(args.cover, "rb") as f:
+            data = f.read()
+        if not image_type(data):
+            raise FatalError("обложка должна быть картинкой JPG, PNG, GIF или WebP")
+        book["cover"] = (data, image_type(data))
     lang = "zh"
     if args.translate:
         if args.engine == "openrouter":
@@ -1200,13 +1251,16 @@ def main():
             key = os.environ.get("OPENROUTER_API_KEY", "")
             try:
                 book["card"] = apply_user_glossary(make_card(book, cache, key, args.model), glossary)
-                print(format_card(book["card"], orig_title, book["author"]))
             except FatalError:
                 raise
             except Exception as e:  # noqa: BLE001 — без справки перевод всё равно возможен
                 print(f"  справка не составлена: {e}")
             tr = OpenRouterTranslator(cache, key, args.model, orig_title, glossary, book.get("card"),
-                                      notes=not args.no_notes)
+                                      notes=not args.no_notes, title=args.title)
+            if args.title:
+                book["card"] = apply_title(book.get("card"), orig_title, args.title)
+            if book.get("card"):
+                print(format_card(book["card"], orig_title, book["author"]))
             lang = "ru"
         else:
             tr = GoogleTranslator(cache, args.lang)
@@ -1215,7 +1269,9 @@ def main():
         if missed:
             print(f"  не переведено фрагментов: {missed} — запустите ещё раз, чтобы допереводить")
 
-    out = args.output or safe_filename(orig_title + ("_" + lang if args.translate else "")) + ".epub"
+    if args.title:
+        book["orig_title"], book["title"] = orig_title, args.title
+    out = args.output or safe_filename(book["title"] + ("_" + lang if args.translate else "")) + ".epub"
     parts = split_book(book, args.max_chars, lang)
     for part in parts:
         name = part_filename(out, part) if len(parts) > 1 else out
