@@ -729,6 +729,53 @@ def make_card(book, cache, api_key, model=DEFAULT_MODEL):
     raise RuntimeError(f"не удалось составить справку о книге: {last}")
 
 
+# ---------------------------------------------------------------- описание загруженной книги
+DESCRIBE_PROMPT = """Ты библиограф. По метаданным файла и началу книги определи, что это за книга, и составь карточку \
+для домашней библиотеки. Книга может быть на любом языке.
+Метаданные файла часто испорчены: транслит («Dolgaya_igra»), подчёркивания, имя файла вместо названия, \
+несколько авторов через подчёркивание (автор и переводчик), пустые поля. Тогда бери название и автора из текста \
+(титульная страница, аннотация, копирайт) или из своих знаний, если узнаёшь книгу. Переводчиков, иллюстраторов \
+и редакторов автором не считай. Ничего не выдумывай: если не уверен, оставь поле пустым.
+Ответь ТОЛЬКО объектом JSON без пояснений и без ```:
+{
+  "known": true или false — узнал ли ты книгу,
+  "title": "название так, как оно напечатано в этом издании, на языке текста, без серии и номера тома",
+  "title_ru": "русское название, если текст не на русском и русское издание или устоявшийся перевод есть, иначе пустая строка",
+  "title_orig": "название оригинала, если это перевод, иначе пустая строка",
+  "author": "автор так, как он указан в этом издании, на языке текста",
+  "author_orig": "имя автора в оригинале, если это перевод, иначе пустая строка",
+  "series": "серия и номер книги в ней, если есть, иначе пустая строка",
+  "genre": "жанр по-русски, коротко",
+  "synopsis": "о чём книга, 3–6 предложений по-русски, без спойлеров финала"
+}"""
+
+DESCRIBE_FIELDS = ("title", "title_ru", "title_orig", "author", "author_orig", "series", "genre", "synopsis")
+
+
+def describe_book(book, api_key, model=DEFAULT_MODEL, usage=None):
+    """Карточка для загруженного EPUB: настоящее название, автор, жанр и описание. None, если не вышло."""
+    sample = book_sample(book, max_chars=9000)
+    for attempt in range(3):
+        try:
+            text = openrouter_chat(api_key, model or DEFAULT_MODEL, [
+                {"role": "system", "content": DESCRIBE_PROMPT},
+                {"role": "user", "content": "Файл: " + book.get("source", "") + "\n\n" + sample}],
+                temperature=0.2, usage=usage)
+            m = re.search(r"\{.*\}", text or "", re.S)
+            raw = json.loads(m.group(0)) if m else None
+            if isinstance(raw, dict):
+                card = {k: _clean(raw.get(k), 1500 if k == "synopsis" else 200) for k in DESCRIBE_FIELDS}
+                card["known"] = raw.get("known") is True
+                if card["title"] or card["synopsis"]:
+                    return card
+        except FatalError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            print(f"Описание: {type(e).__name__}: {e}", file=sys.stderr)
+        time.sleep(3 * (attempt + 1))
+    return None
+
+
 def parse_glossary(text):
     pairs = {}
     for line in (text or "").splitlines():

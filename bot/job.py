@@ -6,6 +6,8 @@
 Параметры берутся из client_payload события repository_dispatch (для локальной проверки — из PAYLOAD):
   chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary,
   save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
+Режим "describe": ничего не собирает, а составляет описание загруженного EPUB (название, автор, жанр,
+о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
 """
 import json
 import os
@@ -135,7 +137,66 @@ def money(x):
     return f"${x:.2f}" if x >= 0.01 else f"${x:.4f}"
 
 
+def download_epub(tmp):
+    info = tg("getFile", file_id=P["file_id"])
+    if not info or not info.get("file_path"):
+        raise b2e.FatalError("Telegram не отдал файл (бот может скачивать файлы до 20 МБ).")
+    src = os.path.join(tmp, "in.epub")
+    with urllib.request.urlopen(f"{TG_API}/file/bot{TOKEN}/{info['file_path']}", timeout=120) as r, \
+            open(src, "wb") as f:
+        f.write(r.read())
+    return src
+
+
+def post_json(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "User-Agent": "book-epub-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status == 200
+    except Exception as e:  # noqa: BLE001
+        print(f"Библиотека: {getattr(e, 'code', '')} {type(e).__name__}", file=sys.stderr)
+        return False
+
+
+def describe():
+    """Описание загруженного EPUB для библиотеки: настоящее название, автор, жанр, о чём книга."""
+    note = P.get("status_text") or ""
+
+    def done(line):  # дописываем итог к сообщению «Сохранено в библиотеку»
+        if STATUS:
+            tg("editMessageText", chat_id=CHAT, message_id=STATUS, text=(note + "\n" + line).strip()[:4000])
+
+    dest = P.get("describe") or {}
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key or not dest.get("url"):
+        return done("📝 Описание не составлено: не задан ключ OpenRouter.")
+    tmp = tempfile.mkdtemp()
+    try:
+        book = b2e.load_from_epub(download_epub(tmp), limit=8)
+    except Exception as e:  # noqa: BLE001 — нет текста, битый файл и т. п.
+        print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
+        return done("📝 Описание не составлено: не получилось прочитать текст книги.")
+    book["source"] = P.get("file_name") or "book.epub"
+    usage = b2e.Usage()
+    try:
+        card = b2e.describe_book(book, api_key, os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL, usage)
+    except b2e.FatalError as e:  # неверный ключ, нет денег и т. п.
+        return done(f"📝 Описание не составлено: {e}"[:300])
+    print("OpenRouter:", usage.summary(), file=sys.stderr)
+    if not card:
+        return done("📝 Описание не составлено: модель не ответила, попробуйте позже из библиотеки.")
+    ok = post_json(dest["url"], {"key": dest.get("key"), "sig": dest.get("sig"), "card": card})
+    if not ok:
+        return done("📝 Описание составлено, но бот не смог его сохранить.")
+    who = card.get("author") or card.get("author_orig")
+    done(f"📝 «{card.get('title') or book['title']}»" + (f", {who}" if who else "") +
+         (f" · {card['genre']}" if card.get("genre") else "") + " — описание добавлено в библиотеку.")
+
+
 def main():
+    if P.get("mode") == "describe":
+        return describe()
     if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
     mode = P.get("mode", "orig")
@@ -153,14 +214,7 @@ def main():
     glossary = P.get("glossary") or ""
 
     if P.get("file_id"):
-        info = tg("getFile", file_id=P["file_id"])
-        if not info or not info.get("file_path"):
-            raise b2e.FatalError("Telegram не отдал файл (бот может скачивать файлы до 20 МБ).")
-        src = os.path.join(tmp, "in.epub")
-        with urllib.request.urlopen(f"{TG_API}/file/bot{TOKEN}/{info['file_path']}", timeout=120) as r, \
-                open(src, "wb") as f:
-            f.write(r.read())
-        book = b2e.load_from_epub(src, limit)
+        book = b2e.load_from_epub(download_epub(tmp), limit)
         book["source"] = P.get("file_name") or "book.epub"
         head = book
     else:

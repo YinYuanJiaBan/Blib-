@@ -82,6 +82,7 @@ export default {
 
     // Сюда задача из GitHub Actions сообщает о готовой книге, чтобы сохранить её в библиотеке.
     if (url.pathname === "/saved" && request.method === "POST") return onSaved(env, request);
+    if (url.pathname === "/info" && request.method === "POST") return onInfo(env, request);
 
     if (url.pathname === "/webhook" && request.method === "POST") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET)
@@ -279,7 +280,8 @@ async function deleteBook(env, key) {
   await Promise.all([env.BOOKS.delete("book:" + key), env.BOOKS.delete("cover:" + key)]);
 }
 
-async function dispatch(env, chat_id, payload) {
+async function dispatch(env, chat_id, payload, quiet = false) {
+  if (!env.GH_TOKEN || !env.GH_REPO) return false;
   const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
     method: "POST",
     headers: {
@@ -292,6 +294,7 @@ async function dispatch(env, chat_id, payload) {
   });
   if (r.status === 204) return true;
   const t = (await r.text()).slice(0, 200);
+  if (quiet) { console.log("dispatch", r.status, t); return false; }
   await say(env, chat_id, `❌ GitHub не принял задачу (${r.status}). Проверьте GH_TOKEN и GH_REPO.\n${t}`);
   return false;
 }
@@ -377,7 +380,7 @@ function cleanInfo(x) {
   if (!x || typeof x !== "object") return {};
   const out = {};
   for (const [k, n] of [["author", 200], ["orig_author", 200], ["genre", 200], ["synopsis", 1500],
-    ["title_en", 200], ["title_literal", 200], ["title_pinyin", 200]]) {
+    ["title_en", 200], ["title_literal", 200], ["title_pinyin", 200], ["title_ru", 200], ["series", 200]]) {
     const v = String(x[k] || "").trim();
     if (v && v !== "—") out[k] = v.slice(0, n);
   }
@@ -480,11 +483,14 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
   if (doc.file_size <= 20 * 1024 * 1024) {
     try { meta = await inspectEpub(env, doc.file_id); } catch (e) { console.log("epub meta", e && e.stack || e); }
   }
+  // Пока модель не составила описание, хотя бы убираем подчёркивания из «Dolgaya_igra».
+  for (const k of ["title", "author"]) if (meta[k]) meta[k] = meta[k].replace(/_+/g, " ").trim();
   const title = meta.title || fileTitle || "Без названия";
   const sizeMb = doc.file_size ? ` · ${(doc.file_size / 1048576).toFixed(1)} МБ` : "";
   const caption = `📗 ${title}` + (meta.author ? `\n${meta.author}` : "");
   const rec = {
-    file_id: doc.file_id, title: title.slice(0, 200), orig_title: "", mode: "lib", chapters: 0,
+    file_id: doc.file_id, file_name: String(doc.file_name || "book.epub").slice(0, 200),
+    title: title.slice(0, 200), orig_title: "", mode: "lib", chapters: 0,
     caption: caption.slice(0, 1000), date: new Date().toISOString(), req: null,
     names: [meta.author, fileTitle, ...(meta.alt || [])].filter(Boolean).map((x) => String(x).slice(0, 200)).slice(0, 12),
     info: cleanInfo({ author: meta.author, genre: meta.subject, synopsis: meta.description })
@@ -494,9 +500,49 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
     await putCover(env, key, meta.cover);
   }
   await putBook(env, key, rec);
-  return reply(`📥 Сохранено в библиотеку: «${title}»` + (meta.author ? `, ${meta.author}` : "") + sizeMb +
+  const text = `📥 Сохранено в библиотеку: «${title}»` + (meta.author ? `, ${meta.author}` : "") + sizeMb +
     (meta.cover ? " · 🖼 с обложкой" : "") +
-    "\nНайти потом: напишите название или автора, или /library.");
+    "\nНайти потом: напишите название или автора, или /library.";
+  const canDescribe = doc.file_size <= 20 * 1024 * 1024 && env.GH_TOKEN && env.GH_REPO;
+  const sent = await reply(text + (canDescribe ? "\n📝 Составляю описание…" : ""));
+  const statusId = sent && sent.result && sent.result.message_id;
+  if (canDescribe && !await describeBook(env, chat, key, rec, statusId, text) && statusId)
+    await tg(env, "editMessageText", { chat_id: chat, message_id: statusId, text: text + "\n📝 Описание не запустилось." });
+  return sent;
+}
+
+// Описание загруженной книги составляет модель в GitHub Actions (bot/job.py, mode=describe):
+// настоящее название (метаданные EPUB часто испорчены), автор, жанр и о чём книга. Результат приходит в /info.
+async function describeBook(env, chat_id, key, rec, statusId, statusText) {
+  return dispatch(env, chat_id, { mode: "describe", chat_id, status_id: statusId || undefined,
+    status_text: statusText ? statusText.slice(0, 3000) : undefined, file_id: rec.file_id,
+    file_name: rec.file_name || "book.epub",
+    describe: { url: ORIGIN + "/info", key, sig: await sign(env, key) } }, true);
+}
+
+async function onInfo(env, request) {
+  if (!env.BOOKS) return new Response("no storage", { status: 501 });
+  const b = await request.json().catch(() => null);
+  if (!b || !/^[0-9a-f]{24}$/.test(b.key || "") || !b.card || typeof b.card !== "object")
+    return new Response("bad request", { status: 400 });
+  if ((await sign(env, b.key)) !== b.sig) return new Response("forbidden", { status: 403 });
+  const rec = await env.BOOKS.get("book:" + b.key, "json");
+  if (!rec) return new Response("gone", { status: 404 });
+  const c = b.card;
+  const str = (k) => String(c[k] || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const oldTitle = rec.title, oldAuthor = (rec.info || {}).author;
+  if (str("title")) rec.title = str("title");
+  if (str("title_orig") && str("title_orig") !== rec.title) rec.orig_title = str("title_orig");
+  const fresh = cleanInfo({ author: c.author, orig_author: c.author_orig, genre: c.genre, synopsis: c.synopsis,
+    series: c.series, title_ru: c.title_ru !== rec.title ? c.title_ru : "" });
+  rec.info = { ...(rec.info || {}), ...fresh };
+  // Прежние (испорченные) варианты оставляем для поиска.
+  rec.names = [...new Set([oldTitle, oldAuthor, str("title_ru"), str("title_orig"), str("author"), str("author_orig"),
+    ...(rec.names || [])].filter(Boolean))].slice(0, 12);
+  rec.caption = (`📗 ${rec.title}` + (rec.info.author ? `\n${rec.info.author}` : "")).slice(0, 1000);
+  rec.described = new Date().toISOString();
+  await putBook(env, b.key, rec);
+  return new Response("ok");
 }
 
 // Читает из EPUB (это ZIP-архив) название, автора, описание и обложку. Работает с файлами до 20 МБ.
@@ -657,7 +703,8 @@ async function onApi(env, request, url) {
   if (route === "book") {
     return json({ title: rec.title, orig_title: rec.orig_title, mode: rec.mode, chapters: rec.chapters, date: rec.date,
       names: rec.names || [], info: rec.info || {}, cover: rec.cover,
-      rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib") });
+      rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib"),
+      describe: rec.mode === "lib" && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described });
   }
   if (request.method !== "POST") return json({ error: "Не тот метод" }, 405);
   if (route === "send") {
@@ -667,6 +714,10 @@ async function onApi(env, request, url) {
   if (route === "rebuild") {
     const r = await rebuild(env, user.id, key);
     return r === true ? json({ ok: true }) : json({ error: r }, 400);
+  }
+  if (route === "describe") {
+    return await describeBook(env, user.id, key, rec) ? json({ ok: true })
+      : json({ error: "Не удалось запустить: проверьте GH_TOKEN и GH_REPO" }, 502);
   }
   if (route === "delete") {
     await deleteBook(env, key);
@@ -984,7 +1035,8 @@ header.scrolled { border-bottom-color: var(--sep); }
     var tags = [mode.icon + " " + mode.name];
     if (b.n) tags.push(plural(b.n, "глава", "главы", "глав"));
     if (info.genre) tags.push(info.genre);
-    var names = [info.title_literal, info.title_en, info.title_pinyin].filter(function (x) { return x && x !== b.t && x !== b.o; });
+    if (info.series) tags.push(info.series);
+    var names = [info.title_ru, info.title_literal, info.title_en, info.title_pinyin].filter(function (x) { return x && x !== b.t && x !== b.o; });
     var html = '<div class="hero"><div class="cover">' + cover(b) + "</div><div>" +
       "<h2>" + esc(b.t || b.o || "Без названия") + "</h2>" +
       (b.o && b.o !== b.t ? '<div class="orig">' + esc(b.o) + "</div>" : "") +
@@ -994,10 +1046,13 @@ header.scrolled { border-bottom-color: var(--sep); }
     html += '<button class="primary" data-act="send">Прислать в чат</button>';
     if (info.synopsis) html += '<div class="sec"><h3>О книге</h3><p>' + esc(info.synopsis) + "</p></div>";
     else if (!d.info) html += '<div class="sec skel"><h3>О книге</h3><div class="t">.</div><div class="a">.</div></div>';
+    else if (d.describe) html += '<div class="sec"><h3>О книге</h3><p style="color:var(--hint)">Описания пока нет. ' +
+      "Нажмите «Составить описание» ниже: бот прочитает начало книги и определит название, автора и жанр.</p></div>";
     if (names.length) html += '<div class="sec names"><h3>Другие названия</h3>' +
       names.map(function (n) { return "<div>" + esc(n) + "</div>"; }).join("") + "</div>";
     if (b.d) html += '<div class="sec"><h3>В библиотеке</h3><p>с ' + esc(date(b.d)) + "</p></div>";
     html += '<div class="actions">' + (d.rebuild ? '<button data-act="rebuild">🔄 Собрать заново</button>' : "") +
+      (d.describe ? '<button data-act="describe">📝 ' + (d.described ? "Составить описание заново" : "Составить описание") + "</button>" : "") +
       '<button class="del" data-act="delete">🗑 Убрать из библиотеки</button></div>';
     return html;
   }
@@ -1022,6 +1077,16 @@ header.scrolled { border-bottom-color: var(--sep); }
     } catch (e) {
       if (st.cur === b) { sh.innerHTML = sheetHtml(b, { info: {} }); toast(e.message); }
     }
+  }
+
+  // Подтянуть свежие данные книги (после описания меняются название и автор).
+  async function refresh(b) {
+    try {
+      var j = await api("/api/books");
+      st.books = j.books;
+      var nb = st.books.find(function (x) { return x.k === b.k; });
+      if (nb && st.cur === b) openBook(nb.k);
+    } catch (e) {}
   }
 
   function closeBook() {
@@ -1053,6 +1118,12 @@ header.scrolled { border-bottom-color: var(--sep); }
       if (!await confirmAsk("Перевести «" + (b.t || b.o) + "» заново? Новый файл заменит этот, перевод снова будет стоить денег.")) return;
       try { await api("/api/rebuild", { k: b.k }); toast("Запущено — прогресс в чате с ботом"); }
       catch (e) { toast(e.message); }
+    } else if (what === "describe") {
+      try {
+        await api("/api/describe", { k: b.k });
+        toast("Составляю описание — около минуты");
+        setTimeout(function () { if (st.cur === b) refresh(b); }, 60000);
+      } catch (e) { toast(e.message); }
     } else if (what === "delete") {
       if (!await confirmAsk("Убрать «" + (b.t || b.o) + "» из библиотеки?")) return;
       try {
