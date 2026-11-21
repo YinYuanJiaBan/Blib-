@@ -710,6 +710,7 @@ function putBook(env, key, rec) {
   const meta = { t: cutBytes(rec.title, 150), o: cutBytes(rec.orig_title, 80), m: rec.mode, n: rec.chapters,
     d: rec.date, a: cutBytes((rec.info || {}).author, 70), s: "" };
   if (rec.cover !== undefined) meta.c = rec.cover;
+  if (rec.cover === 0) meta.cv = rec.cover_v || 1;
   meta.s = cutBytes(names, 1000 - new TextEncoder().encode(JSON.stringify(meta)).length);
   return env.BOOKS.put("book:" + key, JSON.stringify(rec), { metadata: meta });
 }
@@ -817,6 +818,7 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
   if (meta.error) rec.unreadable = String(meta.error).slice(0, 200);
   if (meta.ok) {
     rec.cover = meta.cover ? 1 : 0;
+    rec.cover_v = COVER_V;
     await putCover(env, key, meta.cover);
   }
   await putBook(env, key, rec);
@@ -907,8 +909,15 @@ function inspectFb2(bytes) {
     .filter(Boolean);
   const genres = [...info.matchAll(/<genre\b[^>]*>([\s\S]*?)<\/genre>/gi)].map((m) => xmlText(m[1])).filter(Boolean);
   let cover = null;
-  const img = (info.match(/<coverpage\b[^>]*>[\s\S]*?<image\b([^>]*)>/i) || [])[1];
-  const ref = img && (img.match(/href\s*=\s*["']#?([^"']+)["']/i) || [])[1];
+  const hrefOf = (attrs) => attrs && (attrs.match(/href\s*=\s*["']#?([^"']+)["']/i) || [])[1];
+  let ref = hrefOf((info.match(/<coverpage\b[^>]*>[\s\S]*?<image\b([^>]*)>/i) || [])[1]);
+  // Без <coverpage>: картинка с «cover»/«обложка» в id или картинка в самом начале текста, до первого абзаца.
+  if (!ref) ref = (xml.match(/<binary\b[^>]*\bid\s*=\s*["']([^"']*(?:cover|oblozh|obloj|обложк)[^"']*)["']/i) || [])[1];
+  if (!ref) {
+    const body = (xml.match(/<body\b[^>]*>([\s\S]*?)<\/body>/i) || [])[1] || "";
+    const m = body.match(/<image\b([^>]*)>/i);
+    if (m && !/<p\b[^>]*>\s*[^<\s]/i.test(body.slice(0, m.index))) ref = hrefOf(m[1]);
+  }
   if (ref) {
     const esc = ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const bin = xml.match(new RegExp(`<binary\\b([^>]*\\bid\\s*=\\s*["']${esc}["'][^>]*)>([\\s\\S]*?)</binary>`, "i"));
@@ -1062,7 +1071,12 @@ async function onApi(env, request, url) {
 
   if (route === "books" && request.method === "GET") {
     const items = await listBooks(env);
-    return json({ token: await coverToken(env), books: items.map((k) => ({ k: k.name.slice(5), ...(k.metadata || {}) })) });
+    return json({ token: await coverToken(env), books: items.map((k) => {
+      const b = { k: k.name.slice(5), ...(k.metadata || {}) };
+      if (b.c === 0 && b.cv !== COVER_V) delete b.c;  // «нет обложки» по старому поиску — пусть приложение спросит снова
+      delete b.cv;
+      return b;
+    }) });
   }
 
   const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
@@ -1073,7 +1087,8 @@ async function onApi(env, request, url) {
 
   if (route === "book") {
     return json({ title: rec.title, orig_title: rec.orig_title, mode: rec.mode, chapters: rec.chapters, date: rec.date,
-      names: rec.names || [], info: rec.info || {}, cover: rec.cover,
+      names: rec.names || [], info: rec.info || {},
+      cover: rec.cover === 0 && rec.cover_v !== COVER_V ? undefined : rec.cover,
       rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib"),
       describe: rec.mode === "lib" && !rec.unreadable && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described,
       format: recFormat(rec), other: canConvert(rec) ? otherFormat(recFormat(rec)) : null,
@@ -1107,9 +1122,12 @@ async function onApi(env, request, url) {
   return json({ error: "Неизвестный запрос" }, 404);
 }
 
+// Версия поиска обложки: книги «без обложки» с более старой версией проверяются заново при показе.
+const COVER_V = 2;
 async function putCover(env, key, cover) {
   // Пустое значение — «обложки нет», чтобы не искать её каждый раз заново.
-  await env.BOOKS.put("cover:" + key, cover ? cover.data : new Uint8Array(0), { metadata: { type: cover ? cover.type : "" } });
+  await env.BOOKS.put("cover:" + key, cover ? cover.data : new Uint8Array(0),
+    { metadata: { type: cover ? cover.type : "", v: COVER_V } });
 }
 
 // Обложка книги. Для книг, сохранённых раньше, достаётся из EPUB при первом показе и запоминается.
@@ -1119,6 +1137,7 @@ async function onCover(env, url) {
     return new Response("forbidden", { status: 403 });
   const none = () => new Response("no cover", { status: 404, headers: { "cache-control": "no-store" } });
   let { value, metadata } = await env.BOOKS.getWithMetadata("cover:" + key, "arrayBuffer");
+  if (value !== null && !value.byteLength && (!metadata || metadata.v !== COVER_V)) value = null;
   if (value === null) {
     const rec = await env.BOOKS.get("book:" + key, "json");
     if (!rec) return none();
@@ -1129,6 +1148,7 @@ async function onCover(env, url) {
     const info = cleanInfo({ author: ep.author, synopsis: ep.description, genre: ep.subject });
     rec.info = { ...info, ...(rec.info || {}) };
     rec.cover = ep.cover ? 1 : 0;
+    rec.cover_v = COVER_V;
     await putBook(env, key, rec);
     if (!ep.cover) return none();
     value = ep.cover.data;

@@ -406,9 +406,21 @@ def load_from_fb2(path, limit=None):
         if ann is not None:
             description = _fb2_paras(ann)
     cover = None
+    href = lambda el: next((v for k, v in el.attrib.items() if k.endswith("href")), "").lstrip("#")
     img = info.find(f"{ns}coverpage/{ns}image") if info is not None else None
-    if img is not None:
-        ref = next((v for k, v in img.attrib.items() if k.endswith("href")), "").lstrip("#")
+    ref = href(img) if img is not None else ""
+    # Без <coverpage>: картинка с «cover»/«обложка» в id или картинка в начале текста, до первого абзаца.
+    if not ref:
+        ref = next((k for k in binaries if re.search(r"cover|oblozh|obloj|обложк", k, re.I)), "")
+    first = root.find(f"{ns}body")
+    if not ref and first is not None:
+        for el in first.iter():
+            if el.tag == f"{ns}p" and "".join(el.itertext()).strip():
+                break
+            if el.tag == f"{ns}image":
+                ref = href(el)
+                break
+    if ref:
         try:
             data = base64.b64decode(re.sub(r"\s+", "", binaries.get(ref, "")))
         except ValueError:
