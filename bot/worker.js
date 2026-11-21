@@ -26,14 +26,18 @@ const HELP =
   "Перевод делает DeepSeek через OpenRouter. Готовый файл придёт сюда же.\n\n" +
   "📚 Готовые книги сохраняются: если попросить ту же книгу ещё раз, файл придёт сразу, " +
   "без нового перевода. Можно просто написать название (русское, китайское или английское) " +
-  "или автора, и я найду книгу в библиотеке. /library — все сохранённые книги.";
+  "или автора, и я найду книгу в библиотеке. /library — все сохранённые книги.\n\n" +
+  "📥 Готовый EPUB можно просто положить в библиотеку, без перевода: пришлите файл и нажмите " +
+  "«Сохранить в библиотеку». Чтобы загрузить сразу много книг, включите /upload — " +
+  "тогда каждый присланный EPUB сохраняется сам.";
 
 const BUTTONS = {
   orig: "📖 Оригинал",
   ru: "🇷🇺 Перевод",
-  bi: "🔀 Китайский + русский"
+  bi: "🔀 Китайский + русский",
+  lib: "📥 Сохранить в библиотеку"
 };
-const ICONS = { orig: "📖", ru: "🇷🇺", bi: "🔀" };
+const ICONS = { orig: "📖", ru: "🇷🇺", bi: "🔀", lib: "📗" };
 let ORIGIN = "";  // адрес воркера; задача из Actions сообщает по нему о готовой книге
 
 export default {
@@ -54,6 +58,7 @@ export default {
       await tg(env, "setMyCommands", { commands: [
         { command: "help", description: "Как пользоваться" },
         { command: "library", description: "Сохранённые книги" },
+        { command: "upload", description: "Режим загрузки готовых EPUB в библиотеку" },
         { command: "id", description: "Мой Telegram ID" }
       ] });
       const check = [
@@ -129,12 +134,19 @@ async function onMessage(env, msg) {
     const q = text.replace(/^\/\S+\s*/, "");
     return q ? findBooks(env, chat, q) : showLibrary(env, chat);
   }
+  if (text.startsWith("/upload")) return toggleUpload(env, chat);
 
   const doc = msg.document;
   if (doc) {
     if (!/\.epub$/i.test(doc.file_name || "")) return say(env, chat, "Я понимаю только файлы .epub.");
-    if (doc.file_size > 20 * 1024 * 1024) return say(env, chat, "Файл больше 20 МБ, Telegram не даст боту его скачать.");
-    return ask(env, msg, ["ru", "bi"], "Что сделать с этим EPUB?");
+    // Режим загрузки (/upload) или подпись «в библиотеку» — сразу сохраняем, ничего не спрашивая.
+    if (env.BOOKS && (/в\s+библиотеку/i.test(text) || await env.BOOKS.get("upload:" + chat)))
+      return saveUpload(env, chat, doc, msg.message_id);
+    const big = doc.file_size > 20 * 1024 * 1024;
+    if (big && !env.BOOKS) return say(env, chat, "Файл больше 20 МБ, Telegram не даст боту его скачать.");
+    const modes = big ? ["lib"] : env.BOOKS ? ["ru", "bi", "lib"] : ["ru", "bi"];
+    return ask(env, msg, modes, "Что сделать с этим EPUB?" +
+      (big ? "\nФайл больше 20 МБ: перевести его не получится, но в библиотеку сохранить можно." : ""));
   }
 
   const req = parseRequest(text);
@@ -188,6 +200,15 @@ async function onCallback(env, cq) {
   if (!["go", "re"].includes(action) || !BUTTONS[mode]) return done("Неизвестная команда");
   const src = msg && msg.reply_to_message;
   if (!src) return done("Не нашла исходное сообщение — пришлите ссылку ещё раз");
+
+  // Готовый EPUB — просто кладём в библиотеку, без перевода.
+  if (mode === "lib") {
+    if (!src.document) return done("Не нашла файл — пришлите его ещё раз");
+    await tg(env, "editMessageReplyMarkup", { chat_id: msg.chat.id, message_id: msg.message_id,
+      reply_markup: { inline_keyboard: [] } });
+    await saveUpload(env, msg.chat.id, src.document, src.message_id, msg.message_id);
+    return done("Готово");
+  }
 
   const payload = { chat_id: msg.chat.id, status_id: msg.message_id, mode };
   const req = parseRequest((src.text || src.caption || "").trim());
@@ -306,13 +327,17 @@ async function onSaved(env, request) {
     names: (Array.isArray(b.names) ? b.names : []).map((x) => String(x).slice(0, 200)).filter(Boolean).slice(0, 12),
     req: b.request && typeof b.request === "object" ? b.request : null
   };
+  await putBook(env, b.key, rec);
+  return new Response("ok");
+}
+
+function putBook(env, key, rec) {
   // Все варианты названия и автор — в метаданных, чтобы искать без чтения каждой записи.
   const names = [...new Set([rec.title, rec.orig_title, ...rec.names].map(norm).filter(Boolean))].join("|");
-  await env.BOOKS.put("book:" + b.key, JSON.stringify(rec), {
+  return env.BOOKS.put("book:" + key, JSON.stringify(rec), {
     metadata: { t: cutBytes(rec.title, 160), o: cutBytes(rec.orig_title, 90), m: rec.mode, n: rec.chapters,
       d: rec.date, s: cutBytes(names, 600) }
   });
-  return new Response("ok");
 }
 
 async function listBooks(env) {
@@ -366,4 +391,107 @@ async function findBooks(env, chat, query) {
   }
   return say(env, chat, `🔍 Нашлось книг: ${found.length}` + (found.length > 30 ? " (показаны 30)" : "") +
     ". Какую прислать?", { reply_markup: { inline_keyboard: bookButtons(found.slice(0, 30)) } });
+}
+
+// ---------------------------------------------------------------- загрузка готовых EPUB
+
+async function toggleUpload(env, chat) {
+  if (!env.BOOKS) return say(env, chat, "Библиотека не подключена: у воркера нет KV-хранилища BOOKS. См. bot/README.md.");
+  const key = "upload:" + chat;
+  if (await env.BOOKS.get(key)) {
+    await env.BOOKS.delete(key);
+    return say(env, chat, "📥 Режим загрузки выключен. Присланные EPUB снова можно переводить.");
+  }
+  await env.BOOKS.put(key, "1", { expirationTtl: 3 * 3600 });
+  return say(env, chat, "📥 Режим загрузки включён на 3 часа.\n" +
+    "Присылайте готовые EPUB (можно много сразу) — каждый сохранится в библиотеку без перевода. " +
+    "Название и автор берутся из самого файла.\n/upload ещё раз — выключить.");
+}
+
+// Сохраняет присланный EPUB в библиотеку. Сам файл остаётся у Telegram, в KV — только запись.
+async function saveUpload(env, chat, doc, replyTo, editId) {
+  const reply = (text) => editId
+    ? tg(env, "editMessageText", { chat_id: chat, message_id: editId, text })
+    : say(env, chat, text, { reply_to_message_id: replyTo });
+  if (!env.BOOKS) return reply("Библиотека не подключена: у воркера нет KV-хранилища BOOKS.");
+
+  const key = await bookKey("lib", "tg:" + (doc.file_unique_id || doc.file_id), {});
+  const old = await env.BOOKS.get("book:" + key, "json");
+  if (old) return reply(`📚 «${old.title}» уже есть в библиотеке.`);
+
+  const fileTitle = String(doc.file_name || "book.epub").replace(/\.epub$/i, "").replace(/[_]+/g, " ").trim();
+  let meta = {};
+  if (doc.file_size <= 20 * 1024 * 1024) {
+    try { meta = await epubMeta(env, doc.file_id); } catch (e) { console.log("epub meta", e && e.stack || e); }
+  }
+  const title = meta.title || fileTitle || "Без названия";
+  const sizeMb = doc.file_size ? ` · ${(doc.file_size / 1048576).toFixed(1)} МБ` : "";
+  const caption = `📗 ${title}` + (meta.author ? `\n${meta.author}` : "");
+  const rec = {
+    file_id: doc.file_id, title: title.slice(0, 200), orig_title: "", mode: "lib", chapters: 0,
+    caption: caption.slice(0, 1000), date: new Date().toISOString(), req: null,
+    names: [meta.author, fileTitle, ...(meta.alt || [])].filter(Boolean).map((x) => String(x).slice(0, 200)).slice(0, 12)
+  };
+  await putBook(env, key, rec);
+  return reply(`📥 Сохранено в библиотеку: «${title}»` + (meta.author ? `, ${meta.author}` : "") + sizeMb +
+    "\nНайти потом: напишите название или автора, или /library.");
+}
+
+// Читает название и автора из OPF внутри EPUB (это ZIP-архив). Работает с файлами до 20 МБ.
+async function epubMeta(env, file_id) {
+  const f = await tg(env, "getFile", { file_id });
+  if (!f || !f.ok) return {};
+  const r = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${f.result.file_path}`);
+  if (!r.ok) return {};
+  const zip = await readZip(new Uint8Array(await r.arrayBuffer()));
+  const container = await zip.text("META-INF/container.xml");
+  const opfPath = (container && (container.match(/full-path\s*=\s*["']([^"']+)["']/i) || [])[1]) ||
+    zip.names.find((n) => /\.opf$/i.test(n));
+  const opf = opfPath && await zip.text(opfPath);
+  if (!opf) return {};
+  const all = (tag) => [...opf.matchAll(new RegExp(`<dc:${tag}\\b[^>]*>([\\s\\S]*?)</dc:${tag}>`, "gi"))]
+    .map((m) => xmlText(m[1])).filter(Boolean);
+  const titles = all("title");
+  return { title: titles[0], alt: titles.slice(1), author: all("creator").slice(0, 3).join(", ") };
+}
+
+function xmlText(s) {
+  return s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]+>/g, "")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d))
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&")
+    .replace(/\s+/g, " ").trim();
+}
+
+// Минимальный разбор ZIP: центральный каталог + распаковка deflate.
+async function readZip(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--)
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error("не ZIP");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const entries = {};
+  const dec = new TextDecoder();
+  for (let i = 0; i < count && dv.getUint32(p, true) === 0x02014b50; i++) {
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+    const local = dv.getUint32(p + 42, true);
+    entries[dec.decode(buf.subarray(p + 46, p + 46 + nlen))] = { method, csize, local };
+    p += 46 + nlen + xlen + clen;
+  }
+  return {
+    names: Object.keys(entries),
+    async text(name) {
+      const e = entries[name] || entries[Object.keys(entries).find((n) => n.toLowerCase() === name.toLowerCase())];
+      if (!e) return null;
+      const start = e.local + 30 + dv.getUint16(e.local + 26, true) + dv.getUint16(e.local + 28, true);
+      const data = buf.subarray(start, start + e.csize);
+      if (e.method === 0) return dec.decode(data);
+      if (e.method !== 8) return null;
+      const out = new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw")));
+      return dec.decode(await out.arrayBuffer());
+    }
+  };
 }
