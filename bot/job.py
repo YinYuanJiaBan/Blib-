@@ -38,6 +38,9 @@ CHAT, STATUS = P.get("chat_id"), P.get("status_id")
 
 
 def tg(method, **params):
+    if not CHAT:  # сборка без Telegram (OUT_DIR): сообщения только в журнал
+        print(method, params.get("text", ""), file=sys.stderr)
+        return None
     req = urllib.request.Request(f"{TG_API}/bot{TOKEN}/{method}", data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
@@ -117,7 +120,7 @@ def cached_part(book, tr, mode):
 
 
 def main():
-    if not TOKEN or not CHAT:
+    if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
     mode = P.get("mode", "orig")
     limit = int(P["limit"]) if str(P.get("limit") or "").isdigit() else None
@@ -197,6 +200,13 @@ def main():
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
     if notes:
         caption += "\n" + "\n".join(notes)
+    if os.environ.get("OUT_DIR"):
+        import shutil
+        os.makedirs(os.environ["OUT_DIR"], exist_ok=True)
+        shutil.copy(out, os.path.join(os.environ["OUT_DIR"], name))
+        with open(os.path.join(os.environ["OUT_DIR"], "caption.txt"), "w", encoding="utf-8") as f:
+            f.write(caption)
+        return
     send_document(out, name, caption[:1000])
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if notes else ""), force=True)
 

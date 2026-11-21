@@ -1,14 +1,16 @@
 name: Готовая часть перевода
 
-# Собирает EPUB только из уже переведённого (кэш прошлых запусков), без запросов к модели,
-# и отправляет его в Telegram. Запускается, когда в ветку кладут bot/partial.json:
-#   {"chat_id": 123, "url": "https://www.kanunu8.com/...", "mode": "ru", "cached_only": true}
+# Собирает EPUB только из уже переведённого (кэш прошлых запусков), без запросов к модели.
+# Запускается, когда в ветку кладут bot/partial.json:
+#   {"url": "https://www.kanunu8.com/...", "mode": "ru", "cached_only": true}
+# Если в нём есть chat_id — книга уходит в Telegram. Иначе она шифруется сертификатом
+# bot/partial_cert.pem и коммитится в ту же ветку (out/book.cms): открыть её может только владелец ключа.
 on:
   push:
     paths: [bot/partial.json]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -23,10 +25,25 @@ jobs:
           key: book2epub-partial-${{ github.run_id }}
           restore-keys: book2epub-
 
-      - name: Собрать и отправить готовую часть
-        run: python3 bot/job.py
+      - name: Собрать готовую часть
+        run: |
+          if ! grep -q chat_id bot/partial.json; then export OUT_DIR="$RUNNER_TEMP/out"; fi
+          echo "OUT_DIR=${OUT_DIR:-}" >> "$GITHUB_ENV"
+          python3 bot/job.py
         env:
           PAYLOAD_FILE: bot/partial.json
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+
+      - name: Зашифровать и положить в ветку
+        if: env.OUT_DIR != ''
+        run: |
+          tar -C "$OUT_DIR" -cf "$RUNNER_TEMP/book.tar" .
+          mkdir -p out
+          openssl cms -encrypt -binary -aes256 -in "$RUNNER_TEMP/book.tar" -outform DER -out out/book.cms bot/partial_cert.pem
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add out/book.cms
+          git commit -m "Encrypted partial translation"
+          git push
