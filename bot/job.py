@@ -150,7 +150,8 @@ def main():
 
     missed, lang = 0, "zh"
     if mode in ("ru", "bi"):
-        tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card)
+        tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
+                                      notes=P.get("notes") is not False)
         missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
         lang = "ru"
 

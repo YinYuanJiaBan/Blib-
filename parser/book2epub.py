@@ -243,6 +243,8 @@ def load_from_epub(path, limit=None):
                 continue
             body = re.sub(r"<(script|style)\b.*?</\1>", "", doc, flags=re.S | re.I)
             body = re.sub(r'<p\b[^>]*class="(?:orig|meta)"[^>]*>.*?</p>', "", body, flags=re.S | re.I)
+            body = re.sub(r"<aside\b[^>]*footnote[^>]*>.*?</aside>", "", body, flags=re.S | re.I)
+            body = re.sub(r"<sup\b[^>]*>\s*<a\b[^>]*noteref[^>]*>.*?</a>\s*</sup>", "", body, flags=re.S | re.I)
             head = re.search(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", body, re.S | re.I)
             paras = [_xml_text(p) for p in re.findall(r"<p\b[^>]*>(.*?)</p>", body, re.S | re.I)]
             paras = [p for p in paras if p]
@@ -403,11 +405,36 @@ TRANSLATOR_PROMPT = """Ты профессиональный литератур�
 - Китайские кавычки “” 「」 в прямой речи заменяй тире; в цитатах и названиях — кавычки-«ёлочки». «……» → «…»; \
 реплика из одного многоточия — «— …».
 - Имена, фамилии и топонимы — по системе Палладия, кириллицей, единообразно во всём тексте; имена из глоссария — строго как в глоссарии.
-- Не добавляй комментариев, примечаний, сносок и транслитерации в скобках.
+- Не добавляй комментариев, пояснений и транслитерации в скобках внутри текста.
 
 Формат: каждый фрагмент начинается с метки вида ⟦N⟧. Верни перевод каждого фрагмента, начиная его с той же метки, \
 в том же порядке. Не пропускай, не объединяй и не разбивай фрагменты. Не выводи ничего, кроме фрагментов с метками. \
 Абзацы под заголовком «Контекст» не переводи и не выводи: они нужны только для понимания."""
+
+NOTES_PROMPT = """Сноски:
+Распознавай в оригинале чэнъюи (成语) и другие устойчивые выражения, метафоры, аллюзии на историю, литературу, \
+философию и мифологию, игру слов и культурные реалии, смысл которых русский читатель без пояснения не поймёт \
+или поймёт неверно. В тексте переводи такое выражение художественно, как обычно, а сразу после него ставь метку [^1] \
+(в пределах фрагмента нумеруй 1, 2, 3…). После текста фрагмента, каждую с новой строки, пиши саму сноску:
+[^1]: 金枝玉叶 (jīn zhī yù yè). Дословно: «золотая ветвь, нефритовые листья». Древнее выражение о человеке высокого \
+происхождения, драгоценном и благородном, которого нельзя равнять с простыми людьми.
+Сноска: иероглифы ровно как в оригинале, пиньинь с тонами, дословный перевод, затем 1–3 предложения о настоящем \
+смысле, происхождении и оттенке (ирония, почтение, грубость). Не делай сносок на обычные слова, имена персонажей \
+и очевидные сравнения. Обычно в абзаце сносок нет; больше двух на абзац — только если без них не обойтись."""
+
+NOTE_REF = re.compile(r"\[\^(\d+)\]")
+NOTE_DEF = re.compile(r"^[ \t]*\[\^(\d+)\]:[ \t]*(.+?)[ \t]*$", re.M)
+
+
+def split_notes(text):
+    """Отделяет сноски «[^1]: …» от текста. Возвращает (текст с метками [^1], {номер: сноска})."""
+    notes = {n: t for n, t in NOTE_DEF.findall(text or "")}
+    body = NOTE_DEF.sub("", text or "").strip()
+    return body, notes
+
+
+def strip_notes(text):
+    return NOTE_REF.sub("", split_notes(text)[0]).strip()
 
 
 class OpenRouterTranslator(BaseTranslator):
@@ -416,12 +443,12 @@ class OpenRouterTranslator(BaseTranslator):
     max_chars, max_items, workers = 1800, 40, 3
     context_items = 3
 
-    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None):
+    def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True):
         super().__init__(cache)
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
         self.api_key, self.model = api_key, model or DEFAULT_MODEL
-        self.system = TRANSLATOR_PROMPT
+        self.system = TRANSLATOR_PROMPT + "\n\n" + (NOTES_PROMPT if notes else "Сносок не делай.")
         if book_title:
             self.system += f"\n\nКнига: «{book_title}»" + (f" (по-русски: «{card['title_ru']}»)"
                                                           if card and card.get("title_ru") else "") + "."
@@ -664,16 +691,16 @@ def translate_book(book, translator, bilingual=False, progress=None):
     out = translator.translate(texts, progress)
 
     it = iter(out)
-    book["orig_title"], book["title"] = book["title"], next(it)
-    book["orig_author"], book["author"] = book["author"], next(it)
+    book["orig_title"], book["title"] = book["title"], strip_notes(next(it))
+    book["orig_author"], book["author"] = book["author"], strip_notes(next(it))
     card = book.get("card") or {}
     if card.get("title_ru"):
         book["title"] = card["title_ru"]
     if card.get("author_ru") and book["orig_author"]:
         book["author"] = card["author_ru"]
-    book["description"] = [next(it) for _ in book["description"]]
+    book["description"] = [strip_notes(next(it)) for _ in book["description"]]
     for ch in book["chapters"]:
-        ch["orig_title"], ch["title"] = ch["title"], next(it)
+        ch["orig_title"], ch["title"] = ch["title"], strip_notes(next(it))
         orig = ch["paras"]
         ch["paras"] = [next(it) for _ in orig]
         if bilingual:
@@ -696,6 +723,10 @@ p{text-indent:2em;margin:0 0 .5em;text-align:justify}
 p.orig{color:#555;font-size:.92em;margin-bottom:.15em}
 p.meta{text-indent:0;text-align:center;font-style:italic}
 p.item{text-indent:0;margin-bottom:.4em}
+sup{font-size:.7em;line-height:0}
+sup a{text-decoration:none}
+hr.notes{margin:2em 30% 1em 0;border:0;border-top:1px solid #999}
+p.note{text-indent:0;font-size:.88em;margin-bottom:.6em}
 """
 
 
@@ -717,6 +748,36 @@ def about_body(card):
     return "\n".join(parts)
 
 
+def render_para(text, state, asides):
+    """Абзац в XHTML: метки [^k] становятся всплывающими сносками EPUB 3.
+    Одно и то же выражение поясняется только при первом появлении в книге."""
+    body, notes = split_notes(text)
+    for k in notes:  # сноска есть, а метку модель забыла — ставим в конец абзаца
+        if f"[^{k}]" not in body:
+            body += f"[^{k}]"
+    out, pos = [], 0
+    for m in NOTE_REF.finditer(body):
+        out.append(html.escape(body[pos:m.start()]))
+        pos = m.end()
+        note = notes.get(m.group(1))
+        if not note:
+            continue
+        key = "".join(HAN.findall(note.split("(")[0])) or note[:40]
+        if key in state["seen"]:
+            continue
+        state["seen"].add(key)
+        state["n"] += 1
+        n = state["n"]
+        out.append(f'<sup><a epub:type="noteref" href="#fn{n}" id="fr{n}">{n}</a></sup>')
+        head, sep, rest = note.partition(")")
+        shown = (f"<b>{html.escape(head + sep)}</b>{html.escape(rest)}" if sep and HAN.search(head)
+                 else html.escape(note))
+        asides.append(f'<aside epub:type="footnote" id="fn{n}"><p class="note">'
+                      f'<a href="#fr{n}">{n}</a>. {shown}</p></aside>')
+    out.append(html.escape(body[pos:]))
+    return "".join(out).replace("\n", "<br/>")
+
+
 def build_epub(path, book, lang):
     book_id = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, book["source"] + lang))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -736,15 +797,20 @@ def build_epub(path, book, lang):
     if book.get("card"):
         files.append(("about", "about.xhtml", "О книге", xhtml("О книге", about_body(book["card"]), "ru")))
 
+    note_state = {"n": 0, "seen": set()}
     for n, ch in enumerate(book["chapters"], 1):
         parts = [f"<h2>{esc(ch['title'])}</h2>"]
         if bilingual and ch.get("orig_title") and ch["orig_title"] != ch["title"]:
             parts.append(f'<p class="meta">{esc(ch["orig_title"])}</p>')
         orig = ch.get("orig")
+        asides = []
         for i, p in enumerate(ch["paras"]):
             if orig and orig[i] != p:
                 parts.append(f'<p class="orig">{esc(orig[i])}</p>')
-            parts.append(f"<p>{esc(p)}</p>")
+            parts.append(f"<p>{render_para(p, note_state, asides)}</p>")
+        if asides:
+            parts.append('<hr class="notes"/>')
+            parts.extend(asides)
         files.append((f"c{n:04d}", f"c{n:04d}.xhtml", ch["title"], xhtml(ch["title"], "\n".join(parts), lang)))
 
     toc_title = "Содержание" if lang == "ru" else "目录"
@@ -814,6 +880,7 @@ def main():
                     help="чем переводить (openrouter берёт ключ из OPENROUTER_API_KEY)")
     ap.add_argument("--model", default=os.environ.get("OPENROUTER_MODEL", DEFAULT_MODEL), help="модель OpenRouter")
     ap.add_argument("--glossary", default="", help="файл глоссария: строки «顾茫 = Гу Ман»")
+    ap.add_argument("--no-notes", action="store_true", help="без сносок к идиомам и метафорам (OpenRouter)")
     ap.add_argument("--bilingual", action="store_true", help="с --translate: оригинал над каждым абзацем перевода")
     ap.add_argument("--lang", default="ru", help="язык перевода для Google (по умолчанию ru)")
     ap.add_argument("--limit", type=int, help="взять только первые N глав")
@@ -850,7 +917,8 @@ def main():
                 raise
             except Exception as e:  # noqa: BLE001 — без справки перевод всё равно возможен
                 print(f"  справка не составлена: {e}")
-            tr = OpenRouterTranslator(cache, key, args.model, orig_title, glossary, book.get("card"))
+            tr = OpenRouterTranslator(cache, key, args.model, orig_title, glossary, book.get("card"),
+                                      notes=not args.no_notes)
             lang = "ru"
         else:
             tr = GoogleTranslator(cache, args.lang)

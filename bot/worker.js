@@ -15,7 +15,10 @@ const HELP =
   "• Или пришлите файл .epub, и я его переведу.\n\n" +
   "Дополнительно в том же сообщении (необязательно):\n" +
   "• число — сколько первых глав взять, например: 3\n" +
-  "• глоссарий имён, по строке на имя: 顾茫 = Гу Ман\n\n" +
+  "• глоссарий имён, по строке на имя: 顾茫 = Гу Ман\n" +
+  "• «без сносок» — не пояснять идиомы и метафоры\n\n" +
+  "В переводе идиомы (成语), метафоры и аллюзии получают сноски: иероглифы, пиньинь, " +
+  "дословный перевод и настоящий смысл. В книге сноска открывается нажатием на номер.\n\n" +
   "Сначала придёт справка о книге: русское название, о чём она, персонажи и термины. " +
   "Эти имена бот сам использует в переводе. Если имя не нравится, добавьте свою строку в глоссарий.\n\n" +
   "Перевод делает DeepSeek через OpenRouter. Готовый файл придёт сюда же.";
@@ -93,7 +96,8 @@ function parseRequest(text) {
   const glossary = rest.split("\n").map((l) => l.trim()).filter((l) => /\S\s*[=＝]\s*\S/.test(l)).join("\n");
   const noGloss = rest.split("\n").filter((l) => !/[=＝]/.test(l)).join(" ");
   const limit = (noGloss.match(/(?:^|\s)(\d{1,4})(?:\s|$)/) || [])[1] || "";
-  return { link, glossary: glossary.slice(0, 3000), limit };
+  const notes = !/без\s+сносок/i.test(noGloss);
+  return { link, glossary: glossary.slice(0, 3000), limit, notes };
 }
 
 // ---------------------------------------------------------------- обработчики
@@ -118,7 +122,7 @@ async function onMessage(env, msg) {
 
   const req = parseRequest(text);
   if (req.link) return ask(env, msg, ["orig", "ru", "bi"], "Как собрать книгу?" +
-    (req.limit ? `\nГлав: первые ${req.limit}` : "") + (req.glossary ? `\nСтрок в глоссарии: ${req.glossary.split("\n").length}` : ""));
+    (req.limit ? `\nГлав: первые ${req.limit}` : "") + (req.notes ? "" : "\nБез сносок") + (req.glossary ? `\nСтрок в глоссарии: ${req.glossary.split("\n").length}` : ""));
 
   return say(env, chat, "Пришлите ссылку на оглавление книги с kanunu8.com или файл .epub.\n/help — подробнее");
 }
@@ -152,6 +156,7 @@ async function onCallback(env, cq) {
   }
   if (req.limit) payload.limit = req.limit;
   if (req.glossary) payload.glossary = req.glossary;
+  if (!req.notes) payload.notes = false;
 
   await tg(env, "editMessageText", {
     chat_id: msg.chat.id, message_id: msg.message_id,
