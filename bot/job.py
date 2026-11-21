@@ -27,6 +27,9 @@ def _payload():
     # В Actions параметры читаются из файла события: так они не попадают в публичный журнал запуска.
     if os.environ.get("PAYLOAD"):
         return json.loads(os.environ["PAYLOAD"])
+    if os.environ.get("PAYLOAD_FILE"):
+        with open(os.environ["PAYLOAD_FILE"], encoding="utf-8") as f:
+            return json.load(f)
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         return json.load(f).get("client_payload") or {}
 
@@ -36,6 +39,9 @@ CHAT, STATUS = P.get("chat_id"), P.get("status_id")
 
 
 def tg(method, **params):
+    if not CHAT:  # сборка без Telegram (OUT_DIR): сообщения только в журнал
+        print(method, params.get("text", ""), file=sys.stderr)
+        return None
     req = urllib.request.Request(f"{TG_API}/bot{TOKEN}/{method}", data=json.dumps(params).encode(),
                                  headers={"Content-Type": "application/json"})
     try:
@@ -111,8 +117,26 @@ def bar(done, total, width=12):
     return "▓" * filled + "░" * (width - filled) + f" {done}/{total}"
 
 
+def trim_to_translated(book, orig, reason):
+    """Оставляет главы с начала, переведённые целиком; на первой непереведённой книга обрывается."""
+    keep = []
+    for ch, src in zip(book["chapters"], orig):
+        if any(b2e.HAN.search(o) and t == o for o, t in zip(src, ch["paras"])):
+            break
+        keep.append(ch)
+    total = len(book["chapters"])
+    book["chapters"] = keep
+    book["partial_note"] = f"{reason}: глав {len(keep)} из {total}"
+    if not keep:
+        raise b2e.FatalError(f"{reason}: нет ни одной полностью переведённой главы.")
+
+
+def money(x):
+    return f"${x:.2f}" if x >= 0.01 else f"${x:.4f}"
+
+
 def main():
-    if not TOKEN or not CHAT:
+    if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
     mode = P.get("mode", "orig")
     limit = int(P["limit"]) if str(P.get("limit") or "").isdigit() else None
@@ -150,7 +174,8 @@ def main():
         status("🔎 Составляю справку о книге…", force=True)
         try:
             card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
-            send_text(b2e.format_card(card, head["title"], head.get("author", "")))
+            if not P.get("cached_only"):
+                send_text(b2e.format_card(card, head["title"], head.get("author", "")))
         except b2e.FatalError:
             if mode != "orig":
                 raise
@@ -161,15 +186,55 @@ def main():
     if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
     book["card"] = card
+    if str(P.get("from") or "").isdigit():  # для проверки: начать с главы N (вместе с limit — отрезок книги)
+        book["chapters"] = book["chapters"][int(P["from"]) - 1:]
 
     orig_title, n = book["title"], len(book["chapters"])
     status(f"📚 «{orig_title}» — глав: {n}", force=True)
 
-    missed, lang = 0, "zh"
+    missed, lang, usage_note = 0, "zh", ""
     if mode in ("ru", "bi"):
+        budget = str(P.get("budget") or os.environ.get("TRANSLATE_BUDGET_USD") or "").strip().lstrip("$")
         tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
-                                      notes=P.get("notes") is not False)
-        missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
+                                      notes=P.get("notes") is not False,
+                                      budget=float(budget) if budget.replace(".", "", 1).isdigit() else None)
+        orig = [list(ch["paras"]) for ch in book["chapters"]]
+        if P.get("cached_only"):  # только то, что уже есть в кэше: к модели не обращаемся
+            tr._batch = lambda texts, context=(): [None] * len(texts)
+        t0 = [0.0]
+
+        def plan(total, cached, chars):
+            t0[0] = time.time()
+            if P.get("cached_only"):
+                return
+            left = total - cached
+            msg = f"📊 Абзацев: {total}, уже переведено раньше: {cached}, осталось: {left} (~{chars // 1000} тыс. иероглифов)."
+            if left:
+                msg += f"\nЗапросов к модели: ~{max(1, chars // tr.max_chars + 1)}. Стоимость покажу после первых ответов."
+            if tr.budget:
+                msg += f"\nЛимит расходов: ${tr.budget:g} — дойдя до него, пришлю готовую часть."
+            send_text(msg)
+
+        def tprogress(stage, done, total):
+            if stage != "translate":
+                return progress(stage, done, total)
+            u, lines = tr.usage, [f"🈯 Перевожу\n{bar(done, total)}"]
+            if u.calls and done:
+                share = done / total
+                mins = (time.time() - t0[0]) / share * (1 - share) / 60
+                lines.append(f"💰 {money(u.cost)} · на всё ≈{money(u.cost / share)} · осталось ≈{mins:.0f} мин")
+            status("\n".join(lines), force=done == total)
+
+        tr.on_plan = plan
+        missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=tprogress)
+        print("OpenRouter:", tr.usage.summary(), file=sys.stderr)
+        if P.get("cached_only"):
+            trim_to_translated(book, orig, "Готовая часть перевода")
+            missed = 0
+        elif tr.stop_reason:
+            trim_to_translated(book, orig, f"Остановлено ({tr.stop_reason}), пришлите ещё раз — продолжу")
+            missed = 0
+        usage_note = tr.usage.summary() if tr.usage.calls else ""
         lang = "ru"
 
     status("📦 Собираю EPUB…", force=True)
@@ -183,23 +248,39 @@ def main():
         notes.append(f"⚠️ не загрузились главы: {len(book['failed'])}")
     if missed:
         notes.append(f"⚠️ не переведено фрагментов: {missed} (пришлите задачу ещё раз — допереведу)")
+    if book.get("partial_note"):
+        notes.append("✂️ " + book["partial_note"])
+    if usage_note:
+        notes.append("💰 " + usage_note)
+    n = len(book["chapters"])
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
     if notes:
         caption += "\n" + "\n".join(notes)
+    if os.environ.get("OUT_DIR"):
+        import shutil
+        os.makedirs(os.environ["OUT_DIR"], exist_ok=True)
+        shutil.copy(out, os.path.join(os.environ["OUT_DIR"], name))
+        with open(os.path.join(os.environ["OUT_DIR"], "caption.txt"), "w", encoding="utf-8") as f:
+            f.write(caption)
+        return
     sent = send_document(out, name, caption[:1000])
     saved = False
-    if not notes:  # неполную книгу не сохраняем: повтор её допереведёт
+    # Неполную книгу не сохраняем: повторный запрос её допереведёт.
+    complete = not book["failed"] and not missed and not book.get("partial_note") and not P.get("cached_only")
+    if complete:
         doc = ((sent or {}).get("result") or {}).get("document") or {}
         c = card or {}
+        # Без строки о расходах: при повторной выдаче из библиотеки за перевод уже не платят.
+        lib_caption = "\n".join(x for x in caption.split("\n") if not x.startswith("💰"))
         names = [c.get(k) for k in ("title_ru", "title_literal", "title_en", "title_pinyin", "author_ru")]
         names.append(book.get("author") or head.get("author"))
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
         request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes") if k in P}
         saved = save_to_library(doc.get("file_id"), title=book["title"], orig_title=orig_title, mode=mode,
-                                chapters=n, caption=caption[:1000], names=[x for x in names if x],
+                                chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
                                 request=request)
-    status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if notes else "")
+    status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 
 
