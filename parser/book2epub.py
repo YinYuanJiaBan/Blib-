@@ -17,6 +17,7 @@ book2epub — собирает книгу с kanunu8.com (努努书坊) в EPUB 
 Зависимостей нет — только стандартная библиотека Python 3.8+.
 """
 import argparse
+import base64
 import concurrent.futures as cf
 import hashlib
 import html
@@ -322,6 +323,140 @@ def _epub_cover(z, opf, base, manifest):
     except KeyError:
         return None
     return (data, mtype) if 100 < len(data) <= 5 * 1024 * 1024 else None
+
+
+# ---------------------------------------------------------------- чтение FB2
+def _fb2_bytes(path):
+    """Содержимое .fb2 или .fb2.zip (внутри архива берётся первый .fb2)."""
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if n.lower().endswith(".fb2")] or z.namelist()
+            if not names:
+                raise ValueError("В архиве нет файла .fb2.")
+            return z.read(names[0])
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _fb2_decode(raw):
+    m = re.match(rb'\s*<\?xml[^>]*encoding=["\']([\w.-]+)["\']', raw)
+    for enc in ([m.group(1).decode()] if m else []) + ["utf-8", "cp1251"]:
+        try:
+            return raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _fb2_text(el):
+    """Текст элемента FB2 без ссылок на сноски."""
+    parts = [el.text or ""]
+    for child in el:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if not (tag == "a" and child.get("type") == "note"):
+            parts.append(_fb2_text(child))
+        parts.append(child.tail or "")
+    return re.sub(r"\s+", " ", "".join(parts).replace("\xa0", " ")).strip()
+
+
+def _fb2_paras(el):
+    """Абзацы блока FB2 (p, стихи, цитаты, подзаголовки), без вложенных секций."""
+    out = []
+    for child in el:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag in ("p", "subtitle", "v", "text-author"):
+            if child.get("style") == "orig":  # оригинал в наших двуязычных FB2
+                continue
+            t = _fb2_text(child)
+            if t:
+                out.append(t)
+        elif tag in ("poem", "stanza", "cite", "epigraph"):
+            out.extend(_fb2_paras(child))
+    return out
+
+
+def load_from_fb2(path, limit=None):
+    """Достаёт из FB2 (или FB2.ZIP) заголовок, автора, аннотацию и главы."""
+    import xml.etree.ElementTree as ET
+
+    text = _fb2_decode(_fb2_bytes(path))
+    text = re.sub(r"^\s*<\?xml[^>]*\?>", "", text)
+    binaries = {m.group(1): m.group(2) for m in re.finditer(
+        r'<binary\b[^>]*\bid=["\']([^"\']+)["\'][^>]*>(.*?)</binary>', text, re.S)}
+    text = re.sub(r"<binary\b.*?</binary>", "", text, flags=re.S)  # картинки в тексте не нужны
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"FB2 повреждён: {e}") from None
+    ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+
+    info = root.find(f"{ns}description/{ns}title-info")
+    title, author, description = "", "", []
+    if info is not None:
+        el = info.find(f"{ns}book-title")
+        title = _fb2_text(el) if el is not None else ""
+        a = info.find(f"{ns}author")
+        if a is not None:
+            names = [_fb2_text(x) for t in ("first-name", "middle-name", "last-name")
+                     for x in a.findall(f"{ns}{t}")]
+            author = " ".join(x for x in names if x)
+            if not author and a.find(f"{ns}nickname") is not None:
+                author = _fb2_text(a.find(f"{ns}nickname"))
+        ann = info.find(f"{ns}annotation")
+        if ann is not None:
+            description = _fb2_paras(ann)
+    cover = None
+    img = info.find(f"{ns}coverpage/{ns}image") if info is not None else None
+    if img is not None:
+        ref = next((v for k, v in img.attrib.items() if k.endswith("href")), "").lstrip("#")
+        try:
+            data = base64.b64decode(re.sub(r"\s+", "", binaries.get(ref, "")))
+        except ValueError:
+            data = b""
+        if image_type(data):
+            cover = (data, image_type(data))
+
+    chapters = []
+
+    def walk(sec, parent_title=""):
+        if sec.get("id") == "about":  # справка о книге в наших FB2
+            return
+        t = sec.find(f"{ns}title")
+        head = " ".join(_fb2_paras(t)) if t is not None else ""
+        subs = sec.findall(f"{ns}section")
+        paras = _fb2_paras(sec)
+        if paras or not subs:
+            if paras or head:
+                chapters.append({"title": head or parent_title or f"Глава {len(chapters) + 1}", "paras": paras})
+        for s in subs:
+            walk(s, head)
+
+    for body in root.findall(f"{ns}body"):
+        if body.get("name") in ("notes", "comments"):
+            continue
+        secs = body.findall(f"{ns}section")
+        if not secs:
+            paras = _fb2_paras(body)
+            if paras:
+                chapters.append({"title": title or "Глава 1", "paras": paras})
+        for sec in secs:
+            walk(sec)
+    if limit:
+        chapters = chapters[:limit]
+    if not chapters:
+        raise ValueError("В FB2 не нашлось текста.")
+    return {"title": title or re.sub(r"\.fb2(\.zip)?$", "", os.path.basename(path), flags=re.I),
+            "author": author, "description": description,
+            "chapters": chapters, "source": os.path.basename(path), "failed": [], "cover": cover}
+
+
+def is_fb2(name):
+    return bool(re.search(r"\.fb2(\.zip)?$", name or "", re.I))
+
+
+def load_from_file(path, limit=None, name=None):
+    """EPUB или FB2 — по имени файла."""
+    return (load_from_fb2 if is_fb2(name or path) else load_from_epub)(path, limit)
 
 
 # ---------------------------------------------------------------- перевод
@@ -730,14 +865,17 @@ def parse_card(text):
     return card
 
 
-def make_card(book, cache, api_key, model=DEFAULT_MODEL):
-    """Справка о книге: русское название, о чём она, персонажи и термины. Кэшируется."""
+def make_card(book, cache, api_key, model=DEFAULT_MODEL, cached_only=False):
+    """Справка о книге: русское название, о чём она, персонажи и термины. Кэшируется.
+    cached_only — только из кэша, к модели не обращаться (None, если справки там нет)."""
     model = model or DEFAULT_MODEL
     sample = book_sample(book)
     key = "card:v1:" + model + ":" + hashlib.sha1(sample.encode()).hexdigest()
     cached = cache.get(key)
     if isinstance(cached, dict):
         return cached
+    if cached_only:
+        return None
     last = None
     for attempt in range(3):
         try:
@@ -1063,8 +1201,8 @@ def about_body(card):
     return "\n".join(parts)
 
 
-def render_para(text, state, asides):
-    """Абзац в XHTML: метки [^k] становятся всплывающими сносками EPUB 3.
+def note_pieces(text, state):
+    """Разбирает абзац с метками [^k] на куски: ("text", строка) и ("note", n, текст сноски).
     Одно и то же выражение поясняется только при первом появлении в книге."""
     body, notes = split_notes(text)
     for k in notes:  # сноска есть, а метку модель забыла — ставим в конец абзаца
@@ -1072,7 +1210,7 @@ def render_para(text, state, asides):
             body += f"[^{k}]"
     out, pos = [], 0
     for m in NOTE_REF.finditer(body):
-        out.append(html.escape(body[pos:m.start()]))
+        out.append(("text", body[pos:m.start()]))
         pos = m.end()
         note = notes.get(m.group(1))
         if not note:
@@ -1082,14 +1220,30 @@ def render_para(text, state, asides):
             continue
         state["seen"].add(key)
         state["n"] += 1
-        n = state["n"]
+        out.append(("note", state["n"], note))
+    out.append(("text", body[pos:]))
+    return out
+
+
+def note_html(note, bold="b"):
+    """Текст сноски: иероглифы с пиньинем в скобках — жирным."""
+    head, sep, rest = note.partition(")")
+    if sep and HAN.search(head):
+        return f"<{bold}>{html.escape(head + sep)}</{bold}>{html.escape(rest)}"
+    return html.escape(note)
+
+
+def render_para(text, state, asides):
+    """Абзац в XHTML: метки [^k] становятся всплывающими сносками EPUB 3."""
+    out = []
+    for piece in note_pieces(text, state):
+        if piece[0] == "text":
+            out.append(html.escape(piece[1]))
+            continue
+        _, n, note = piece
         out.append(f'<sup><a epub:type="noteref" href="#fn{n}" id="fr{n}">{n}</a></sup>')
-        head, sep, rest = note.partition(")")
-        shown = (f"<b>{html.escape(head + sep)}</b>{html.escape(rest)}" if sep and HAN.search(head)
-                 else html.escape(note))
         asides.append(f'<aside epub:type="footnote" id="fn{n}"><p class="note">'
-                      f'<a href="#fr{n}">{n}</a>. {shown}</p></aside>')
-    out.append(html.escape(body[pos:]))
+                      f'<a href="#fr{n}">{n}</a>. {note_html(note)}</p></aside>')
     return "".join(out).replace("\n", "<br/>")
 
 
@@ -1195,6 +1349,105 @@ def build_epub(path, book, lang):
             z.writestr(f"OEBPS/cover.{cover_ext}", cover[0], compress_type=zipfile.ZIP_STORED)
 
 
+def build_fb2(path, book, lang):
+    """Собирает книгу в FictionBook 2.1: справка, главы, сноски — в отдельном теле notes."""
+    esc = html.escape
+    bilingual = any(ch.get("orig") for ch in book["chapters"])
+    book_id = str(uuid.uuid5(uuid.NAMESPACE_URL, book["source"] + lang + str(book.get("part") or "") + "fb2"))
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def paras(text, style=""):
+        attr = f' style="{style}"' if style else ""
+        return "".join(f"<p{attr}>{line}</p>" for line in text.split("\n") if line.strip()) or "<empty-line/>"
+
+    def person(name, tag="author"):
+        words = name.split()
+        if len(words) == 2 and not HAN.search(name):
+            return f"<{tag}><first-name>{esc(words[0])}</first-name><last-name>{esc(words[1])}</last-name></{tag}>"
+        return f"<{tag}><nickname>{esc(name or '—')}</nickname></{tag}>"
+
+    note_state, notes = {"n": 0, "seen": set()}, []
+    sections = []
+    card = book.get("card")
+    if card:
+        about = re.sub(r'<p class="(?:meta|item)">', "<p>", about_body(card))
+        about = re.sub(r"<h1>(.*?)</h1>", r"<title><p>\1</p></title>", about, count=1)
+        about = re.sub(r"<h2>(.*?)</h2>", r"<subtitle>\1</subtitle>", about)
+        about = about.replace("<b>", "<strong>").replace("</b>", "</strong>")
+        sections.append(f'<section id="about">\n{about}\n</section>')
+    for ch in book["chapters"]:
+        out = [f"<title><p>{esc(ch['title'])}</p>"]
+        if bilingual and ch.get("orig_title") and ch["orig_title"] != ch["title"]:
+            out.append(f"<p>{esc(ch['orig_title'])}</p>")
+        out.append("</title>")
+        orig = ch.get("orig")
+        for i, p in enumerate(ch["paras"]):
+            if orig and orig[i] != p:
+                out.append(paras("\n".join(f"<emphasis>{esc(x)}</emphasis>" for x in orig[i].split("\n") if x.strip()),
+                                 "orig"))
+            text = []
+            for piece in note_pieces(p, note_state):
+                if piece[0] == "text":
+                    text.append(esc(piece[1]))
+                else:
+                    _, n, note = piece
+                    text.append(f'<a l:href="#n{n}" type="note">[{n}]</a>')
+                    notes.append(f'<section id="n{n}"><title><p>{n}</p></title>'
+                                 f'<p>{note_html(note, "strong")}</p></section>')
+            out.append(paras("".join(text)))
+        sections.append("<section>\n" + "\n".join(out) + "\n</section>")
+
+    title_info = [f"<genre>{'prose_classic' if lang == 'zh' else 'foreign_prose'}</genre>",
+                  person(book["author"]), f"<book-title>{esc(book['title'])}</book-title>"]
+    if book["description"]:
+        title_info.append("<annotation>" + "".join(paras(esc(p)) for p in book["description"]) + "</annotation>")
+    cover = book.get("cover")
+    cover_ext = {v: k for k, v in IMAGE_TYPES.items()}.get(cover[1], "jpg") if cover else ""
+    if cover:
+        title_info.append(f'<coverpage><image l:href="#cover.{cover_ext}"/></coverpage>')
+    title_info.append(f"<lang>{lang}</lang>")
+    if lang != "zh":
+        title_info.append("<src-lang>zh</src-lang>")
+    src_info = ""
+    if book.get("orig_title") or book.get("orig_author"):
+        src_info = ("<src-title-info><genre>prose_classic</genre>" + person(book.get("orig_author") or book["author"])
+                    + f"<book-title>{esc(book.get('orig_title') or book['title'])}</book-title><lang>zh</lang>"
+                    + "</src-title-info>")
+    main_title = [f"<p>{esc(book['title'])}</p>"]
+    if book.get("orig_title") and book["orig_title"] != book["title"]:
+        main_title.append(f"<p>{esc(book['orig_title'])}</p>")
+    author_line = book["author"]
+    if book.get("orig_author") and book["orig_author"] != book["author"]:
+        author_line = f'{book["author"]} ({book["orig_author"]})'
+    if author_line:
+        main_title.insert(0, f"<p>{esc(author_line)}</p>")
+    doc = f"""<?xml version="1.0" encoding="utf-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
+<description>
+<title-info>{"".join(title_info)}</title-info>
+{src_info}
+<document-info>{person("book2epub")}<program-used>book2epub</program-used><date value="{today}">{today}</date>
+<src-url>{esc(book["source"])}</src-url><id>{book_id}</id><version>1.0</version></document-info>
+</description>
+<body>
+<title>{"".join(main_title)}</title>
+{chr(10).join(sections)}
+</body>
+"""
+    if notes:
+        doc += '<body name="notes">\n<title><p>Примечания</p></title>\n' + "\n".join(notes) + "\n</body>\n"
+    if cover:
+        doc += (f'<binary id="cover.{cover_ext}" content-type="{cover[1]}">'
+                + base64.b64encode(cover[0]).decode() + "</binary>\n")
+    doc += "</FictionBook>\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(doc)
+
+
+def build_book(path, book, lang, fmt="epub"):
+    (build_fb2 if fmt == "fb2" else build_epub)(path, book, lang)
+
+
 def safe_filename(s):
     return (re.sub(r'[\\/:*?"<>|\s]+', "_", s).strip("_") or "book")[:80]
 
@@ -1202,8 +1455,10 @@ def safe_filename(s):
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description="Собрать книгу с kanunu8.com в EPUB (с переводом на русский).")
-    ap.add_argument("source", help="ссылка на оглавление книги или путь к .epub")
-    ap.add_argument("-o", "--output", help="имя EPUB-файла")
+    ap.add_argument("source", help="ссылка на оглавление книги или путь к .epub / .fb2")
+    ap.add_argument("-o", "--output", help="имя файла (.epub или .fb2)")
+    ap.add_argument("--format", choices=["epub", "fb2"],
+                    help="формат книги (по умолчанию — как у -o или у присланного файла, иначе epub)")
     ap.add_argument("--translate", action="store_true", help="перевести на русский")
     ap.add_argument("--engine", choices=["google", "openrouter"], default="google",
                     help="чем переводить (openrouter берёт ключ из OPENROUTER_API_KEY)")
@@ -1228,8 +1483,8 @@ def main():
         label = {"download": "загружено глав", "translate": "переведено частей"}[stage]
         print(f"\r  {label}: {done}/{total}", end="" if done < total else "\n", flush=True)
 
-    if args.source.lower().endswith(".epub") and os.path.exists(args.source):
-        book = load_from_epub(args.source, args.limit)
+    if re.search(r"\.(epub|fb2|fb2\.zip)$", args.source, re.I) and os.path.exists(args.source):
+        book = load_from_file(args.source, args.limit)
     else:
         print(f"Оглавление: {args.source}")
         book = load_from_site(args.source, cache, args.limit, args.workers, args.delay, progress)
@@ -1271,11 +1526,14 @@ def main():
 
     if args.title:
         book["orig_title"], book["title"] = orig_title, args.title
-    out = args.output or safe_filename(book["title"] + ("_" + lang if args.translate else "")) + ".epub"
+    fmt = args.format or ("fb2" if is_fb2(args.output or args.source) else "epub")
+    out = args.output or safe_filename(book["title"] + ("_" + lang if args.translate else "")) + "." + fmt
+    if out.lower().endswith(".fb2.zip"):
+        out = out[:-4]
     parts = split_book(book, args.max_chars, lang)
     for part in parts:
         name = part_filename(out, part) if len(parts) > 1 else out
-        build_epub(name, part, lang)
+        build_book(name, part, lang, fmt)
         size = sum(_chapter_size(ch) for ch in part["chapters"])
         print(f"Готово: {name}" + (f" (глав: {len(part['chapters'])}, знаков: {size})" if len(parts) > 1 else ""))
 

@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Задача для GitHub Actions: собирает книгу (по ссылке или из присланного EPUB),
-при необходимости переводит через OpenRouter и отправляет EPUB в Telegram.
+Задача для GitHub Actions: собирает книгу (по ссылке или из присланного EPUB / FB2),
+при необходимости переводит через OpenRouter и отправляет EPUB или FB2 в Telegram.
 
 Параметры берутся из client_payload события repository_dispatch (для локальной проверки — из PAYLOAD):
   chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary,
   edit — {title, cover, thumb}: своё название книги и обложка (file_id картинки и её уменьшенной копии в Telegram),
+  format ("epub" | "fb2"; у файлов — edit.format): в каком формате прислать книгу; по умолчанию — как у
+  присланного файла, иначе epub. Передаётся, только если отличается: в client_payload не больше 10 полей,
   save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
-Режим "describe": ничего не собирает, а составляет описание загруженного EPUB (название, автор, жанр,
+Второй формат книги из библиотеки: save.alt = "epub" | "fb2". Книга собирается с теми же настройками,
+но перевод берётся только из кэша (за второй формат не платят), а файл сохраняется рядом с первым.
+Режим "convert": присланный готовый файл (file_id, file_name) переводится в формат save.alt без пересборки.
+Режим "describe": ничего не собирает, а составляет описание загруженного EPUB / FB2 (название, автор, жанр,
 о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
 """
 import json
+import re
 import os
 import sys
 import tempfile
@@ -18,6 +24,7 @@ import time
 import traceback
 import urllib.request
 import uuid
+import zipfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "parser"))
 import book2epub as b2e  # noqa: E402
@@ -39,6 +46,8 @@ def _payload():
 
 P = _payload()
 CHAT, STATUS = P.get("chat_id"), P.get("status_id")
+ALT = (P.get("save") or {}).get("alt") or ""  # собираем второй формат книги из библиотеки
+CACHED_ONLY = bool(P.get("cached_only") or ALT)
 
 
 def tg(method, **params):
@@ -55,6 +64,9 @@ def tg(method, **params):
         return None
 
 
+MIME = {"epub": "application/epub+zip", "fb2": "application/x-fictionbook+xml"}
+
+
 def send_document(path, filename, caption, thumb=None):
     boundary = uuid.uuid4().hex
     parts = []
@@ -67,7 +79,7 @@ def send_document(path, filename, caption, thumb=None):
         data = f.read()
     fn = filename.replace('"', "")
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{fn}"\r\n'
-                  f"Content-Type: application/epub+zip\r\n\r\n").encode() + data + b"\r\n")
+                  f"Content-Type: {MIME['fb2' if filename.lower().endswith('.fb2') else 'epub']}\r\n\r\n").encode() + data + b"\r\n")
     if thumb:
         parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="thumb"; filename="thumb.jpg"\r\n'
                       f"Content-Type: image/jpeg\r\n\r\n").encode() + thumb + b"\r\n")
@@ -83,6 +95,8 @@ def save_to_library(file_id, **info):
     save = P.get("save") or {}
     if not (save.get("url") and save.get("key") and file_id):
         return False
+    if ALT:  # второй формат: воркер добавит файлы к уже сохранённой книге
+        info = {"file_ids": info.get("file_ids"), "alt": ALT}
     body = json.dumps({"key": save["key"], "sig": save.get("sig", ""), "file_id": file_id, **info}).encode()
     req = urllib.request.Request(save["url"], data=body, headers={"Content-Type": "application/json",
                                                                  "User-Agent": "book-epub-bot"})
@@ -153,11 +167,15 @@ def download(file_id, max_bytes=20 * 1024 * 1024):
         return r.read(max_bytes + 1)
 
 
-def download_epub(tmp):
-    src = os.path.join(tmp, "in.epub")
+def load_upload(tmp, limit=None):
+    """Скачивает присланный EPUB или FB2 (.fb2.zip) и читает его."""
+    src = os.path.join(tmp, "in" + (".fb2" if b2e.is_fb2(P.get("file_name")) else ".epub"))
     with open(src, "wb") as f:
         f.write(download(P["file_id"]))
-    return src
+    try:
+        return b2e.load_from_file(src, limit)
+    except (ValueError, KeyError, zipfile.BadZipFile) as e:
+        raise b2e.FatalError(f"Не удалось прочитать файл: {e}") from None
 
 
 def user_cover(edit):
@@ -203,7 +221,7 @@ def describe():
         return done("📝 Описание не составлено: не задан ключ OpenRouter.")
     tmp = tempfile.mkdtemp()
     try:
-        book = b2e.load_from_epub(download_epub(tmp), limit=8)
+        book = load_upload(tmp, limit=8)
     except Exception as e:  # noqa: BLE001 — нет текста, битый файл и т. п.
         print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
         return done("📝 Описание не составлено: не получилось прочитать текст книги.")
@@ -224,9 +242,30 @@ def describe():
          (f" · {card['genre']}" if card.get("genre") else "") + " — описание добавлено в библиотеку.")
 
 
+def convert():
+    """Готовый файл из библиотеки — в другой формат (EPUB ⇄ FB2), без перевода и без деления на тома."""
+    fmt = ALT if ALT in ("epub", "fb2") else "epub"
+    status(f"🔁 Перевожу файл в {fmt.upper()}…", force=True)
+    tmp = tempfile.mkdtemp()
+    book = load_upload(tmp)
+    book["source"] = P.get("file_name") or "book"
+    lang = "ru" if not b2e.zh_chars([p for ch in book["chapters"][:5] for p in ch["paras"]]) else "zh"
+    root = re.sub(r"\.(epub|fb2|fb2\.zip)$", "", P.get("file_name") or "", flags=re.I) or b2e.safe_filename(book["title"])
+    out = os.path.join(tmp, "out." + fmt)
+    b2e.build_book(out, book, lang, fmt)
+    caption = f"📗 {book['title']}" + (f"\n{book['author']}" if book.get("author") else "") + f"\n📥 {fmt.upper()}"
+    thumb = b2e.make_thumbnail(book["cover"][0]) if book.get("cover") else None
+    sent = send_document(out, root + "." + fmt, caption[:1000], thumb)
+    file_id = (((sent or {}).get("result") or {}).get("document") or {}).get("file_id")
+    saved = save_to_library(file_id, file_ids=[file_id])
+    status(f"✅ Готово: {fmt.upper()}" + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
+
+
 def main():
     if P.get("mode") == "describe":
         return describe()
+    if P.get("mode") == "convert":
+        return convert()
     if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
     mode = P.get("mode", "orig")
@@ -246,7 +285,7 @@ def main():
     cover, thumb = user_cover(edit)
 
     if P.get("file_id"):
-        book = b2e.load_from_epub(download_epub(tmp), limit)
+        book = load_upload(tmp, limit)
         book["source"] = P.get("file_name") or "book.epub"
         head = book
     else:
@@ -262,18 +301,22 @@ def main():
     if api_key:
         status("🔎 Составляю справку о книге…", force=True)
         try:
-            tr_card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
+            raw = b2e.make_card(head, cache, api_key, model, cached_only=CACHED_ONLY)
+            if raw is None:
+                raise LookupError("справки нет в кэше")
+            tr_card = b2e.apply_user_glossary(raw, glossary)
             # Переводчику — справка как есть (её текст входит в ключ кэша переводов), а своё название он
             # получит отдельно; в справку для читателя и в её глоссарий — своё название.
             card = b2e.apply_title(tr_card, head["title"], title) if title else tr_card
-            if not P.get("cached_only"):
+            if not CACHED_ONLY:
                 send_text(b2e.format_card(card, head["title"], head.get("author", "")))
         except b2e.FatalError:
             if mode != "orig":
                 raise
         except Exception as e:  # noqa: BLE001 — без справки книга всё равно соберётся
             print(f"Справка: {type(e).__name__}: {e}", file=sys.stderr)
-            send_text("⚠️ Справку о книге составить не удалось, перевожу без неё.")
+            if not CACHED_ONLY:
+                send_text("⚠️ Справку о книге составить не удалось, перевожу без неё.")
 
     if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
@@ -294,13 +337,13 @@ def main():
                                       budget=float(budget) if budget.replace(".", "", 1).isdigit() else None,
                                       title=title or None)
         orig = [list(ch["paras"]) for ch in book["chapters"]]
-        if P.get("cached_only"):  # только то, что уже есть в кэше: к модели не обращаемся
+        if CACHED_ONLY:  # только то, что уже есть в кэше: к модели не обращаемся
             tr._batch = lambda texts, context=(): [None] * len(texts)
         t0 = [0.0]
 
         def plan(total, cached, chars):
             t0[0] = time.time()
-            if P.get("cached_only"):
+            if CACHED_ONLY:
                 return
             left = total - cached
             msg = f"📊 Абзацев: {total}, уже переведено раньше: {cached}, осталось: {left} (~{chars // 1000} тыс. иероглифов)."
@@ -323,6 +366,10 @@ def main():
         tr.on_plan = plan
         missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=tprogress)
         print("OpenRouter:", tr.usage.summary(), file=sys.stderr)
+        if ALT and (missed or any(b2e.HAN.search(o) and t == o for ch, src in zip(book["chapters"], orig)
+                                  for o, t in zip(src, ch["paras"]))):
+            raise b2e.FatalError("Перевода этой книги больше нет в кэше, поэтому второй формат бесплатно не собрать. "
+                                 "Пришлите книгу ещё раз со словом «" + ALT + "» — переведу заново.")
         if P.get("cached_only"):
             trim_to_translated(book, orig, "Готовая часть перевода")
             missed = 0
@@ -334,15 +381,17 @@ def main():
 
     if title:
         book["orig_title"], book["title"] = orig_title, title
-    status("📦 Собираю EPUB…", force=True)
+    fmt = P.get("format") or edit.get("format") or ("fb2" if b2e.is_fb2(P.get("file_name")) else "epub")
+    fmt = fmt if fmt in ("epub", "fb2") else "epub"
+    status(f"📦 Собираю {fmt.upper()}…", force=True)
     suffix = {"orig": "", "ru": "_ru", "bi": "_zh-ru"}[mode]
-    name = b2e.safe_filename(book["title"]) + suffix + ".epub"
+    name = b2e.safe_filename(book["title"]) + suffix + "." + fmt
     # Длинная книга (больше 140 тыс. знаков китайского текста) делится на несколько томов.
     parts = b2e.split_book(book, int(os.environ.get("MAX_PART_CHARS") or b2e.MAX_PART_CHARS), lang)
     outs = []
     for k, part in enumerate(parts, 1):
-        out = os.path.join(tmp, f"book_{k}.epub")
-        b2e.build_epub(out, part, lang)
+        out = os.path.join(tmp, f"book_{k}.{fmt}")
+        b2e.build_book(out, part, lang, fmt)
         outs.append((out, b2e.part_filename(name, part) if len(parts) > 1 else name, part))
 
     notes = []
@@ -394,7 +443,8 @@ def main():
         names.append(book.get("author") or head.get("author"))
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
-        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes", "edit")
+        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes", "edit",
+                                       "format")
                    if k in P}
         # Справка для карточки книги в мини-приложении.
         info = {"author": c.get("author_ru") or book.get("author") or head.get("author"),
@@ -403,7 +453,7 @@ def main():
                 "title_literal": c.get("title_literal"), "title_pinyin": c.get("title_pinyin")}
         saved = save_to_library(file_ids[0], file_ids=file_ids, title=book["title"], orig_title=orig_title,
                                 mode=mode, chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
-                                request=request, info={k: v for k, v in info.items() if v})
+                                request=request, info={k: v for k, v in info.items() if v}, format=fmt)
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 

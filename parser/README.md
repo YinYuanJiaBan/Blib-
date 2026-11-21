@@ -15,6 +15,10 @@ python3 book2epub.py URL --translate
 # Двуязычная книга: под каждым китайским абзацем перевод
 python3 book2epub.py URL --translate --bilingual
 
+# FB2: прочитать .fb2 / .fb2.zip и собрать книгу в FB2
+python3 book2epub.py book.fb2 --translate --engine openrouter   # → *.fb2
+python3 book2epub.py URL --format fb2
+
 # Проба на первых 3 главах
 python3 book2epub.py URL --translate --limit 3 -o proba.epub
 ```
@@ -26,8 +30,9 @@ python3 book2epub.py URL --translate --limit 3 -o proba.epub
 | `--lang en` | перевести на другой язык |
 | `--limit N` | только первые N глав |
 | `--title "Остатки грязи"` | своё название книги вместо предложенного нейросетью (попадёт в справку и в глоссарий перевода) |
-| `--cover обложка.jpg` | обложка EPUB (JPG, PNG, GIF или WebP); у EPUB на входе своя обложка сохраняется и без этого |
-| `-o файл.epub` | имя выходного файла |
+| `--cover обложка.jpg` | обложка книги (JPG, PNG, GIF или WebP); у EPUB и FB2 на входе своя обложка сохраняется и без этого |
+| `-o файл.epub` | имя выходного файла (`.fb2` — собрать FB2) |
+| `--format fb2` | формат книги: `epub` или `fb2` (по умолчанию как у `-o` или у входного файла) |
 | `--max-chars N` | книга длиннее N знаков китайского текста делится на тома (по умолчанию 140000, `0` — не делить) |
 | `--workers`, `--delay` | скорость загрузки (по умолчанию 4 потока и пауза 0,3 с) |
 
