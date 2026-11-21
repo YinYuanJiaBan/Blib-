@@ -440,7 +440,7 @@ def strip_notes(text):
 class OpenRouterTranslator(BaseTranslator):
     """Перевод через OpenRouter (по умолчанию DeepSeek) с метками ⟦N⟧ у фрагментов."""
     name = "openrouter"
-    max_chars, max_items, workers = 1800, 40, 3
+    max_chars, max_items, workers = 1200, 25, 4
     context_items = 3
 
     def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True):
@@ -448,6 +448,7 @@ class OpenRouterTranslator(BaseTranslator):
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
         self.api_key, self.model = api_key, model or DEFAULT_MODEL
+        self.stats = {"calls": 0, "retries": 0}  # для статуса в чате и журнала
         self.system = TRANSLATOR_PROMPT + "\n\n" + (NOTES_PROMPT if notes else "Сносок не делай.")
         if book_title:
             self.system += f"\n\nКнига: «{book_title}»" + (f" (по-русски: «{card['title_ru']}»)"
@@ -480,8 +481,13 @@ class OpenRouterTranslator(BaseTranslator):
     def _batch(self, texts, context=()):
         last, incomplete = None, False
         for attempt in range(5):
+            t0 = time.time()
             try:
                 res = self._call(texts, context)
+                self.stats["calls"] += 1
+                ok = sum(1 for r in res if r)
+                # В журнал — только время и счётчики, без текста книги.
+                print(f"  запрос: фрагментов {len(texts)}, переведено {ok}, {time.time() - t0:.0f} с", file=sys.stderr)
                 if all(res):
                     return res
                 last, incomplete = "модель вернула не все фрагменты", True
@@ -491,6 +497,9 @@ class OpenRouterTranslator(BaseTranslator):
                 raise
             except Exception as e:  # noqa: BLE001 — сеть/перегрузка: ждём и повторяем
                 last, incomplete = e, False
+                print(f"  запрос не удался за {time.time() - t0:.0f} с: {type(e).__name__}: {str(e)[:200]}",
+                      file=sys.stderr)
+            self.stats["retries"] += 1
             time.sleep(min(30, 2 * 2 ** attempt))
         if incomplete and len(texts) > 1:
             mid = (len(texts) + 1) // 2
@@ -586,10 +595,12 @@ def make_card(book, cache, api_key, model=DEFAULT_MODEL):
         return cached
     last = None
     for attempt in range(3):
+        t0 = time.time()
         try:
             card = parse_card(openrouter_chat(api_key, model, [
                 {"role": "system", "content": CARD_PROMPT},
                 {"role": "user", "content": "Начало книги:\n\n" + sample}], temperature=0.2))
+            print(f"  справка: {time.time() - t0:.0f} с, {'готова' if card else 'неверный формат'}", file=sys.stderr)
             if card:
                 cache.put(key, card)
                 return card

@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.request
@@ -74,12 +75,23 @@ def send_text(text):
         tg("sendMessage", chat_id=CHAT, text=chunk)
 
 
-_last = {"t": 0.0, "text": ""}
+_last = {"t": 0.0, "text": "", "base": ""}
+START = time.time()
+TRANSLATOR = {}  # переводчик, когда он создан: из него берутся счётчики запросов
 
 
 def status(text, force=False):
-    """Редактирует сообщение-статус не чаще раза в 10 секунд."""
+    """Редактирует сообщение-статус не чаще раза в 10 секунд. Добавляет время с начала работы."""
     now = time.time()
+    _last["base"] = text
+    mins = int((now - START) // 60)
+    extra = f"\n⏱ {mins} мин" if mins and not text.startswith(("✅", "❌")) else ""
+    tr = TRANSLATOR.get("tr")
+    if extra and tr and text.startswith("🈯"):
+        extra += f" · запросов к модели: {tr.stats['calls']}"
+        if tr.stats["retries"]:
+            extra += f", повторов: {tr.stats['retries']}"
+    text += extra
     if text == _last["text"] or (not force and now - _last["t"] < 10):
         return
     _last.update(t=now, text=text)
@@ -87,6 +99,14 @@ def status(text, force=False):
         tg("editMessageText", chat_id=CHAT, message_id=STATUS, text=text)
     else:
         tg("sendMessage", chat_id=CHAT, text=text)
+
+
+def heartbeat():
+    """Раз в 30 секунд обновляет статус, чтобы было видно, что работа идёт."""
+    while True:
+        time.sleep(30)
+        if _last["base"]:
+            status(_last["base"])
 
 
 def bar(done, total, width=12):
@@ -107,6 +127,7 @@ def main():
         status(f"{label}\n{bar(done, total)}", force=done == total)
 
     status("⚙️ Начинаю…", force=True)
+    threading.Thread(target=heartbeat, daemon=True).start()
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL
     glossary = P.get("glossary") or ""
@@ -152,6 +173,8 @@ def main():
     if mode in ("ru", "bi"):
         tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
                                       notes=P.get("notes") is not False)
+        TRANSLATOR["tr"] = tr
+        status("🈯 Перевожу…", force=True)
         missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
         lang = "ru"
 
