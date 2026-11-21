@@ -7,30 +7,31 @@ on:
 permissions:
   contents: read
 
-# Задачи одного чата выполняются по очереди.
+# Задачи одного чата выполняются по очереди. Описания загруженных книг (mode=describe) короткие
+# и идут сразу, каждое отдельно: в общей очереди GitHub держит только одну ждущую задачу и отменяет остальные.
 concurrency:
-  group: book-${{ github.event.client_payload.chat_id }}
+  group: ${{ github.event.client_payload.mode == 'describe' && format('describe-{0}', github.run_id) || format('book-{0}', github.event.client_payload.chat_id) }}
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: ${{ github.event.client_payload.mode == 'describe' && 10 || 340 }}
+    env:
+      DESCRIBE: ${{ github.event.client_payload.mode == 'describe' }}
     steps:
       - uses: actions/checkout@v4
 
       # Кэш скачанных глав и переводов: если задача упала, повтор продолжит с того же места.
       - uses: actions/cache/restore@v4
+        if: env.DESCRIBE != 'true'
         with:
           path: .book2epub_cache
           key: book2epub-${{ github.run_id }}
           restore-keys: book2epub-
 
       - name: Собрать и отправить книгу
-        # Pillow — для значка-обложки у файла в Telegram; без него книга соберётся и так.
-        run: |
-          python3 -m pip install -q --break-system-packages pillow || true
-          python3 bot/job.py
+        run: python3 bot/job.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -41,7 +42,7 @@ jobs:
           MAX_PART_CHARS: ${{ vars.MAX_PART_CHARS }}
 
       - uses: actions/cache/save@v4
-        if: always()
+        if: always() && env.DESCRIBE != 'true'
         with:
           path: .book2epub_cache
           key: book2epub-${{ github.run_id }}
