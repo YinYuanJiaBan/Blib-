@@ -800,12 +800,109 @@ def translate_book(book, translator, bilingual=False, progress=None):
         book["author"] = card["author_ru"]
     book["description"] = [strip_notes(next(it)) for _ in book["description"]]
     for ch in book["chapters"]:
+        ch["zh_chars"] = zh_chars(ch["paras"])  # размер оригинала — для разбивки на тома
         ch["orig_title"], ch["title"] = ch["title"], strip_notes(next(it))
         orig = ch["paras"]
         ch["paras"] = [next(it) for _ in orig]
         if bilingual:
             ch["orig"] = orig
     return translator.missed
+
+
+# ---------------------------------------------------------------- разбивка на тома
+MAX_PART_CHARS = 140000
+
+
+def zh_chars(paras):
+    """Сколько знаков в китайском тексте (без пробелов; абзацы без иероглифов не считаются)."""
+    return sum(len(re.sub(r"\s+", "", p)) for p in paras if HAN.search(p))
+
+
+def _chapter_size(ch):
+    return ch.get("zh_chars") if ch.get("zh_chars") is not None else zh_chars(ch.get("orig") or ch["paras"])
+
+
+def _split_chapter(ch, limit):
+    """Глава длиннее лимита режется по абзацам на куски примерно равной длины."""
+    src = ch.get("orig") or ch["paras"]
+    sizes = [zh_chars([p]) for p in src]
+    total = sum(sizes)
+    n = -(-total // limit)
+    target = total / n
+    pieces, start, acc = [], 0, 0
+    for i, size in enumerate(sizes):
+        if i > start and len(pieces) < n - 1 and (acc + size > limit or acc + size / 2 > target):
+            pieces.append((start, i, acc))
+            start, acc = i, 0
+        acc += size
+    pieces.append((start, len(sizes), acc))
+    out = []
+    for k, (a, b, size) in enumerate(pieces, 1):
+        part = dict(ch, paras=ch["paras"][a:b], zh_chars=size)
+        if ch.get("orig"):
+            part["orig"] = ch["orig"][a:b]
+        if k > 1:
+            part["title"] = f'{ch["title"]} ({k})'
+            if ch.get("orig_title"):
+                part["orig_title"] = f'{ch["orig_title"]} ({k})'
+        out.append(part)
+    return out
+
+
+def split_book(book, limit=MAX_PART_CHARS, lang="zh"):
+    """Делит книгу на тома не больше limit знаков китайского текста каждый, по границам глав.
+    Тома выходят примерно равными. Возвращает список книг; если делить не нужно — [book]."""
+    if not limit:
+        return [book]
+    chapters = []
+    for ch in book["chapters"]:
+        chapters.extend(_split_chapter(ch, limit) if _chapter_size(ch) > limit else [ch])
+    sizes = [_chapter_size(ch) for ch in chapters]
+    total = sum(sizes)
+    if total <= limit:
+        return [book]
+
+    def greedy(cap):
+        groups, cur, acc = [], [], 0
+        for ch, size in zip(chapters, sizes):
+            if cur and acc + size > cap:
+                groups.append(cur)
+                cur, acc = [], 0
+            cur.append(ch)
+            acc += size
+        return groups + [cur] if cur else groups
+
+    # Минимум томов при лимите, затем самый маленький «потолок», при котором их столько же:
+    # так тома выходят ровнее, а последний не остаётся крошечным.
+    n = len(greedy(limit))
+    lo, hi = max(sizes), limit
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(greedy(mid)) <= n:
+            hi = mid
+        else:
+            lo = mid + 1
+    groups = greedy(lo)
+    parts = []
+    for k, group in enumerate(groups, 1):
+        part = dict(book, chapters=group, part=k, parts=len(groups))
+        zh_label = f"第{k}册（共{len(groups)}册）"
+        if lang == "zh":
+            part["title"] = f'{book["title"]} {zh_label}'
+        else:
+            part["title"] = f'{book["title"]}. Книга {k} из {len(groups)}'
+            if book.get("orig_title"):
+                part["orig_title"] = f'{book["orig_title"]} {zh_label}'
+        parts.append(part)
+    return parts
+
+
+def part_filename(name, part):
+    """book.epub → book_1.epub для тома 1."""
+    if not part.get("parts"):
+        return name
+    root, ext = os.path.splitext(name)
+    return f"{root}_{part['part']}{ext}"
 
 
 # ---------------------------------------------------------------- EPUB
@@ -879,7 +976,7 @@ def render_para(text, state, asides):
 
 
 def build_epub(path, book, lang):
-    book_id = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, book["source"] + lang))
+    book_id = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, book["source"] + lang + str(book.get("part") or "")))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     esc = html.escape
     bilingual = any(ch.get("orig") for ch in book["chapters"])
@@ -986,6 +1083,8 @@ def main():
     ap.add_argument("--limit", type=int, help="взять только первые N глав")
     ap.add_argument("--workers", type=int, default=4, help="параллельных загрузок (по умолчанию 4)")
     ap.add_argument("--delay", type=float, default=0.3, help="пауза между запросами к сайту, сек")
+    ap.add_argument("--max-chars", type=int, default=MAX_PART_CHARS,
+                    help=f"книга длиннее стольких знаков китайского текста делится на тома (по умолчанию {MAX_PART_CHARS}, 0 — не делить)")
     ap.add_argument("--cache", default=".book2epub_cache", help="папка кэша")
     args = ap.parse_args()
 
@@ -1028,8 +1127,12 @@ def main():
             print(f"  не переведено фрагментов: {missed} — запустите ещё раз, чтобы допереводить")
 
     out = args.output or safe_filename(orig_title + ("_" + lang if args.translate else "")) + ".epub"
-    build_epub(out, book, lang)
-    print(f"Готово: {out}")
+    parts = split_book(book, args.max_chars, lang)
+    for part in parts:
+        name = part_filename(out, part) if len(parts) > 1 else out
+        build_epub(name, part, lang)
+        size = sum(_chapter_size(ch) for ch in part["chapters"])
+        print(f"Готово: {name}" + (f" (глав: {len(part['chapters'])}, знаков: {size})" if len(parts) > 1 else ""))
 
 
 if __name__ == "__main__":

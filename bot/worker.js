@@ -270,12 +270,18 @@ async function sign(env, key) {
   return [...s].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function sendSaved(env, chat_id, saved, key) {
+async function sendSaved(env, chat_id, saved, key) {
   const row = [{ text: "🗑 Убрать из библиотеки", callback_data: "del:" + key }];
   if (saved.req) row.unshift({ text: "🔄 Собрать заново", callback_data: "rb:" + key });
   const date = saved.date ? `\nСохранено: ${saved.date.slice(0, 10)}` : "";
-  return tg(env, "sendDocument", { chat_id, document: saved.file_id,
-    caption: (saved.caption || "").slice(0, 980) + date, reply_markup: { inline_keyboard: [row] } });
+  // Длинная книга хранится несколькими томами: шлём их по порядку, подпись и кнопки — у последнего.
+  const ids = Array.isArray(saved.file_ids) && saved.file_ids.length ? saved.file_ids : [saved.file_id];
+  for (let i = 0; i < ids.length - 1; i++) {
+    await tg(env, "sendDocument", { chat_id, document: ids[i], caption: `📕 Книга ${i + 1} из ${ids.length}` });
+  }
+  const last = ids.length > 1 ? `\n📕 Книга ${ids.length} из ${ids.length}` : "";
+  return tg(env, "sendDocument", { chat_id, document: ids[ids.length - 1],
+    caption: (saved.caption || "").slice(0, 940) + last + date, reply_markup: { inline_keyboard: [row] } });
 }
 
 // Обрезает строку так, чтобы она заняла не больше n байт UTF-8 (метаданные KV — до 1024 байт).
@@ -300,7 +306,9 @@ async function onSaved(env, request) {
   if (!b || !/^[0-9a-f]{24}$/.test(b.key || "") || !b.file_id) return new Response("bad request", { status: 400 });
   if ((await sign(env, b.key)) !== b.sig) return new Response("forbidden", { status: 403 });
   const rec = {
-    file_id: String(b.file_id), title: String(b.title || "").slice(0, 200),
+    file_id: String(b.file_id),
+    file_ids: (Array.isArray(b.file_ids) ? b.file_ids : []).map(String).filter(Boolean).slice(0, 50),
+    title: String(b.title || "").slice(0, 200),
     orig_title: String(b.orig_title || "").slice(0, 200), mode: String(b.mode || ""),
     chapters: b.chapters || 0, caption: String(b.caption || "").slice(0, 1000), date: new Date().toISOString(),
     names: (Array.isArray(b.names) ? b.names : []).map((x) => String(x).slice(0, 200)).filter(Boolean).slice(0, 12),
