@@ -190,8 +190,15 @@ def main():
     saved = False
     if not notes:  # неполную книгу не сохраняем: повтор её допереведёт
         doc = ((sent or {}).get("result") or {}).get("document") or {}
+        c = card or {}
+        names = [c.get(k) for k in ("title_ru", "title_literal", "title_en", "title_pinyin", "author_ru")]
+        names.append(book.get("author") or head.get("author"))
+        if P.get("file_name"):
+            names.append(os.path.splitext(P["file_name"])[0])
+        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes") if k in P}
         saved = save_to_library(doc.get("file_id"), title=book["title"], orig_title=orig_title, mode=mode,
-                                chapters=n, caption=caption[:1000])
+                                chapters=n, caption=caption[:1000], names=[x for x in names if x],
+                                request=request)
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if notes else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 
