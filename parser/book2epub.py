@@ -865,14 +865,17 @@ def parse_card(text):
     return card
 
 
-def make_card(book, cache, api_key, model=DEFAULT_MODEL):
-    """Справка о книге: русское название, о чём она, персонажи и термины. Кэшируется."""
+def make_card(book, cache, api_key, model=DEFAULT_MODEL, cached_only=False):
+    """Справка о книге: русское название, о чём она, персонажи и термины. Кэшируется.
+    cached_only — только из кэша, к модели не обращаться (None, если справки там нет)."""
     model = model or DEFAULT_MODEL
     sample = book_sample(book)
     key = "card:v1:" + model + ":" + hashlib.sha1(sample.encode()).hexdigest()
     cached = cache.get(key)
     if isinstance(cached, dict):
         return cached
+    if cached_only:
+        return None
     last = None
     for attempt in range(3):
         try:

@@ -292,6 +292,12 @@ async function onCallback(env, cq) {
     return done(r === true ? undefined : r);
   }
 
+  // «📥 FB2» / «📥 EPUB» под файлом: прислать книгу во втором формате (собрать, если его ещё нет).
+  if (action === "cv") {
+    const r = await sendOtherFormat(env, msg.chat.id, arg, extra);
+    return done(r === true ? "Отправляю" : r === "started" ? "Собираю — около минуты" : r);
+  }
+
   // Книга из списка /library.
   if (action === "get") {
     const saved = env.BOOKS && await env.BOOKS.get("book:" + arg, "json");
@@ -371,6 +377,40 @@ async function onCallback(env, cq) {
 }
 
 // Собрать книгу из библиотеки заново с теми же ссылкой и настройками. true или текст ошибки.
+// Книга во втором формате: из библиотеки, если уже собрана, иначе — задача в Actions.
+// true — файл отправлен, "started" — сборка запущена, иначе текст ошибки.
+async function sendOtherFormat(env, chat_id, key, format) {
+  const rec = env.BOOKS && await env.BOOKS.get("book:" + key, "json");
+  if (!rec) return "Этой книги больше нет в библиотеке";
+  const own = recFormat(rec);
+  const fmt = ["epub", "fb2"].includes(format) ? format : otherFormat(own);
+  if (fmt === own || (rec.alt && rec.alt[fmt])) {
+    await sendSaved(env, chat_id, rec, key, fmt);
+    return true;
+  }
+  if (!canConvert(rec)) return "Эту книгу не собрать в другом формате — пришлите её ещё раз со словом «" + fmt + "»";
+  const title = rec.title || rec.orig_title || "книга";
+  const st = await say(env, chat_id, `⏳ 📥 «${title}» в ${fmt.toUpperCase()} — собираю, около минуты…`);
+  const status_id = st && st.result && st.result.message_id;
+  const save = { url: ORIGIN + "/saved", key, sig: await sign(env, key), alt: fmt };
+  let payload;
+  if (rec.mode === "lib") {
+    payload = { mode: "convert", chat_id, status_id, file_id: rec.file_id, file_name: rec.file_name || "book.epub", save };
+  } else {
+    // Те же настройки, что у основного файла; перевод берётся только из кэша (save.alt), за него не платят.
+    const q = { ...rec.req };
+    delete q.format;
+    if (q.edit) {
+      q.edit = { ...q.edit };
+      delete q.edit.format;
+      if (!Object.values(q.edit).some(Boolean)) delete q.edit;
+    }
+    payload = { ...q, chat_id, status_id, save };
+    setFormat(payload, fmt);
+  }
+  return await dispatch(env, chat_id, payload) ? "started" : "Ошибка запуска";
+}
+
 async function rebuild(env, chat_id, key) {
   const saved = env.BOOKS && await env.BOOKS.get("book:" + key, "json");
   const q = saved && saved.req;
@@ -570,13 +610,34 @@ async function sign(env, key) {
   return hex(await hmac(env.WEBHOOK_SECRET, "book:" + key));
 }
 
-async function sendSaved(env, chat_id, saved, key) {
+// Формат основного файла книги в библиотеке.
+function recFormat(rec) {
+  const q = rec.req || {};
+  return rec.format || q.format || (q.edit || {}).format || fileKind(rec.file_name || q.file_name) || "epub";
+}
+const otherFormat = (f) => f === "fb2" ? "epub" : "fb2";
+
+// Можно ли получить книгу во втором формате: она уже есть, её можно собрать заново из кэша
+// или перевести в другой формат готовый файл (до 20 МБ — больше Telegram боту не отдаст).
+function canConvert(rec) {
+  const other = otherFormat(recFormat(rec));
+  if (rec.alt && rec.alt[other]) return true;
+  if (rec.mode === "lib") return !!rec.file_id && !(rec.size > 20 * 1024 * 1024);
+  return !!(rec.req && (rec.req.url || rec.req.file_id) && BUTTONS[rec.req.mode]);
+}
+
+async function sendSaved(env, chat_id, saved, key, format) {
+  const own = recFormat(saved);
+  const fmt = format && format !== own && saved.alt && saved.alt[format] ? format : own;
+  const other = otherFormat(fmt);
   const rows = [[{ text: "🗑 Убрать из библиотеки", callback_data: "del:" + key }]];
   if (saved.req && saved.mode !== "lib") rows.unshift([{ text: "🔄 Собрать заново", callback_data: "rb:" + key },
     { text: "✏️ Изменить", callback_data: "chg:" + key }]);
+  if (fmt !== own || canConvert(saved)) rows.unshift([{ text: "📥 " + other.toUpperCase(), callback_data: `cv:${key}:${other}` }]);
   const date = saved.date ? `\nСохранено: ${saved.date.slice(0, 10)}` : "";
   // Длинная книга хранится несколькими томами: шлём их по порядку, подпись и кнопки — у последнего.
-  const ids = Array.isArray(saved.file_ids) && saved.file_ids.length ? saved.file_ids : [saved.file_id];
+  const files = fmt === own ? saved : saved.alt[fmt];
+  const ids = Array.isArray(files.file_ids) && files.file_ids.length ? files.file_ids : [files.file_id];
   for (let i = 0; i < ids.length - 1; i++) {
     await tg(env, "sendDocument", { chat_id, document: ids[i], caption: `📕 Книга ${i + 1} из ${ids.length}` });
   }
@@ -606,9 +667,18 @@ async function onSaved(env, request) {
   const b = await request.json().catch(() => null);
   if (!b || !/^[0-9a-f]{24}$/.test(b.key || "") || !b.file_id) return new Response("bad request", { status: 400 });
   if ((await sign(env, b.key)) !== b.sig) return new Response("forbidden", { status: 403 });
+  const file_ids = (Array.isArray(b.file_ids) ? b.file_ids : []).map(String).filter(Boolean).slice(0, 50);
+  if (b.alt) {  // второй формат книги — кладём рядом с основным файлом
+    if (!["epub", "fb2"].includes(b.alt)) return new Response("bad request", { status: 400 });
+    const old = await env.BOOKS.get("book:" + b.key, "json");
+    if (!old) return new Response("gone", { status: 404 });
+    old.alt = { ...(old.alt || {}), [b.alt]: { file_id: String(b.file_id), file_ids } };
+    await putBook(env, b.key, old);
+    return new Response("ok");
+  }
   const rec = {
     file_id: String(b.file_id),
-    file_ids: (Array.isArray(b.file_ids) ? b.file_ids : []).map(String).filter(Boolean).slice(0, 50),
+    file_ids, format: ["epub", "fb2"].includes(b.format) ? b.format : undefined,
     title: String(b.title || "").slice(0, 200),
     orig_title: String(b.orig_title || "").slice(0, 200), mode: String(b.mode || ""),
     chapters: b.chapters || 0, caption: String(b.caption || "").slice(0, 1000), date: new Date().toISOString(),
@@ -736,7 +806,7 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
   const sizeMb = doc.file_size ? ` · ${(doc.file_size / 1048576).toFixed(1)} МБ` : "";
   const caption = `📗 ${title}` + (meta.author ? `\n${meta.author}` : "");
   const rec = {
-    file_id: doc.file_id, file_name: String(doc.file_name || "book.epub").slice(0, 200),
+    file_id: doc.file_id, file_name: String(doc.file_name || "book.epub").slice(0, 200), size: doc.file_size || 0,
     title: title.slice(0, 200), orig_title: "", mode: "lib", chapters: 0,
     caption: caption.slice(0, 1000), date: new Date().toISOString(), req: null,
     names: [meta.author, fileTitle, ...(meta.alt || [])].filter(Boolean).map((x) => String(x).slice(0, 200)).slice(0, 12),
@@ -999,12 +1069,18 @@ async function onApi(env, request, url) {
     return json({ title: rec.title, orig_title: rec.orig_title, mode: rec.mode, chapters: rec.chapters, date: rec.date,
       names: rec.names || [], info: rec.info || {}, cover: rec.cover,
       rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib"),
-      describe: rec.mode === "lib" && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described });
+      describe: rec.mode === "lib" && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described,
+      format: recFormat(rec), other: canConvert(rec) ? otherFormat(recFormat(rec)) : null,
+      other_ready: !!(rec.alt && rec.alt[otherFormat(recFormat(rec))]) });
   }
   if (request.method !== "POST") return json({ error: "Не тот метод" }, 405);
   if (route === "send") {
     const r = await sendSaved(env, user.id, rec, key);
     return r && r.ok ? json({ ok: true }) : json({ error: "Telegram не отправил файл: " + (r && r.description || "ошибка") }, 502);
+  }
+  if (route === "other") {
+    const r = await sendOtherFormat(env, user.id, key, body.f);
+    return r === true || r === "started" ? json({ ok: true, started: r === "started" }) : json({ error: r }, 400);
   }
   if (route === "rebuild") {
     const r = await rebuild(env, user.id, key);
@@ -1342,7 +1418,9 @@ header.scrolled { border-bottom-color: var(--sep); }
       (author ? '<div class="by">' + esc(author) + "</div>" : "") +
       '<div class="tags">' + tags.map(function (t) { return '<span class="tag">' + esc(t) + "</span>"; }).join("") + "</div>" +
       "</div></div>";
-    html += '<button class="primary" data-act="send">Прислать в чат</button>';
+    html += '<button class="primary" data-act="send">Прислать в чат' + (d.format ? " · " + d.format.toUpperCase() : "") + "</button>";
+    if (d.other) html += '<div class="actions"><button data-act="other">📥 Прислать в ' + d.other.toUpperCase() +
+      (d.other_ready ? "" : " (соберу за минуту)") + "</button></div>";
     if (info.synopsis) html += '<div class="sec"><h3>О книге</h3><p>' + esc(info.synopsis) + "</p></div>";
     else if (!d.info) html += '<div class="sec skel"><h3>О книге</h3><div class="t">.</div><div class="a">.</div></div>';
     else if (d.describe) html += '<div class="sec"><h3>О книге</h3><p style="color:var(--hint)">Описания пока нет. ' +
@@ -1362,6 +1440,7 @@ header.scrolled { border-bottom-color: var(--sep); }
     if (!b) return;
     haptic();
     st.cur = b;
+    st.detail = null;
     var sh = $("sheet");
     sh.innerHTML = sheetHtml(b); sh.scrollTop = 0;
     sh.classList.add("open"); sh.setAttribute("aria-hidden", "false");
@@ -1373,6 +1452,7 @@ header.scrolled { border-bottom-color: var(--sep); }
       var d = await api("/api/book?k=" + k);
       if (d.cover !== undefined) b.c = d.cover;
       if (d.info && d.info.author && !b.a) b.a = d.info.author;
+      st.detail = d;
       if (st.cur === b) sh.innerHTML = sheetHtml(b, d);
     } catch (e) {
       if (st.cur === b) { sh.innerHTML = sheetHtml(b, { info: {} }); toast(e.message); }
@@ -1414,6 +1494,15 @@ header.scrolled { border-bottom-color: var(--sep); }
         if (tg && INIT && tg.isVersionAtLeast && !tg.isVersionAtLeast("6.0")) tg.close();
       } catch (e) { toast(e.message); }
       if (tg && INIT) tg.MainButton.hideProgress();
+    } else if (what === "other") {
+      var d = st.detail || {};
+      if (!d.other) return;
+      try {
+        var r = await api("/api/other", { k: b.k, f: d.other });
+        haptic("medium");
+        toast(r.started ? "Собираю " + d.other.toUpperCase() + " — файл придёт в чат" : "Файл отправлен в чат с ботом");
+        if (r.started) setTimeout(function () { if (st.cur === b) refresh(b); }, 90000);
+      } catch (e) { toast(e.message); }
     } else if (what === "rebuild") {
       if (!await confirmAsk("Перевести «" + (b.t || b.o) + "» заново? Новый файл заменит этот, перевод снова будет стоить денег.")) return;
       try { await api("/api/rebuild", { k: b.k }); toast("Запущено — прогресс в чате с ботом"); }

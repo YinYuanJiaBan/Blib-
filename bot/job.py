@@ -9,10 +9,14 @@
   format ("epub" | "fb2"; у файлов — edit.format): в каком формате прислать книгу; по умолчанию — как у
   присланного файла, иначе epub. Передаётся, только если отличается: в client_payload не больше 10 полей,
   save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
+Второй формат книги из библиотеки: save.alt = "epub" | "fb2". Книга собирается с теми же настройками,
+но перевод берётся только из кэша (за второй формат не платят), а файл сохраняется рядом с первым.
+Режим "convert": присланный готовый файл (file_id, file_name) переводится в формат save.alt без пересборки.
 Режим "describe": ничего не собирает, а составляет описание загруженного EPUB / FB2 (название, автор, жанр,
 о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
 """
 import json
+import re
 import os
 import sys
 import tempfile
@@ -42,6 +46,8 @@ def _payload():
 
 P = _payload()
 CHAT, STATUS = P.get("chat_id"), P.get("status_id")
+ALT = (P.get("save") or {}).get("alt") or ""  # собираем второй формат книги из библиотеки
+CACHED_ONLY = bool(P.get("cached_only") or ALT)
 
 
 def tg(method, **params):
@@ -89,6 +95,8 @@ def save_to_library(file_id, **info):
     save = P.get("save") or {}
     if not (save.get("url") and save.get("key") and file_id):
         return False
+    if ALT:  # второй формат: воркер добавит файлы к уже сохранённой книге
+        info = {"file_ids": info.get("file_ids"), "alt": ALT}
     body = json.dumps({"key": save["key"], "sig": save.get("sig", ""), "file_id": file_id, **info}).encode()
     req = urllib.request.Request(save["url"], data=body, headers={"Content-Type": "application/json",
                                                                  "User-Agent": "book-epub-bot"})
@@ -234,9 +242,30 @@ def describe():
          (f" · {card['genre']}" if card.get("genre") else "") + " — описание добавлено в библиотеку.")
 
 
+def convert():
+    """Готовый файл из библиотеки — в другой формат (EPUB ⇄ FB2), без перевода и без деления на тома."""
+    fmt = ALT if ALT in ("epub", "fb2") else "epub"
+    status(f"🔁 Перевожу файл в {fmt.upper()}…", force=True)
+    tmp = tempfile.mkdtemp()
+    book = load_upload(tmp)
+    book["source"] = P.get("file_name") or "book"
+    lang = "ru" if not b2e.zh_chars([p for ch in book["chapters"][:5] for p in ch["paras"]]) else "zh"
+    root = re.sub(r"\.(epub|fb2|fb2\.zip)$", "", P.get("file_name") or "", flags=re.I) or b2e.safe_filename(book["title"])
+    out = os.path.join(tmp, "out." + fmt)
+    b2e.build_book(out, book, lang, fmt)
+    caption = f"📗 {book['title']}" + (f"\n{book['author']}" if book.get("author") else "") + f"\n📥 {fmt.upper()}"
+    thumb = b2e.make_thumbnail(book["cover"][0]) if book.get("cover") else None
+    sent = send_document(out, root + "." + fmt, caption[:1000], thumb)
+    file_id = (((sent or {}).get("result") or {}).get("document") or {}).get("file_id")
+    saved = save_to_library(file_id, file_ids=[file_id])
+    status(f"✅ Готово: {fmt.upper()}" + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
+
+
 def main():
     if P.get("mode") == "describe":
         return describe()
+    if P.get("mode") == "convert":
+        return convert()
     if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
     mode = P.get("mode", "orig")
@@ -272,18 +301,22 @@ def main():
     if api_key:
         status("🔎 Составляю справку о книге…", force=True)
         try:
-            tr_card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
+            raw = b2e.make_card(head, cache, api_key, model, cached_only=CACHED_ONLY)
+            if raw is None:
+                raise LookupError("справки нет в кэше")
+            tr_card = b2e.apply_user_glossary(raw, glossary)
             # Переводчику — справка как есть (её текст входит в ключ кэша переводов), а своё название он
             # получит отдельно; в справку для читателя и в её глоссарий — своё название.
             card = b2e.apply_title(tr_card, head["title"], title) if title else tr_card
-            if not P.get("cached_only"):
+            if not CACHED_ONLY:
                 send_text(b2e.format_card(card, head["title"], head.get("author", "")))
         except b2e.FatalError:
             if mode != "orig":
                 raise
         except Exception as e:  # noqa: BLE001 — без справки книга всё равно соберётся
             print(f"Справка: {type(e).__name__}: {e}", file=sys.stderr)
-            send_text("⚠️ Справку о книге составить не удалось, перевожу без неё.")
+            if not CACHED_ONLY:
+                send_text("⚠️ Справку о книге составить не удалось, перевожу без неё.")
 
     if not P.get("file_id"):
         book = b2e.load_from_site(P["url"], cache, limit, progress=progress)
@@ -304,13 +337,13 @@ def main():
                                       budget=float(budget) if budget.replace(".", "", 1).isdigit() else None,
                                       title=title or None)
         orig = [list(ch["paras"]) for ch in book["chapters"]]
-        if P.get("cached_only"):  # только то, что уже есть в кэше: к модели не обращаемся
+        if CACHED_ONLY:  # только то, что уже есть в кэше: к модели не обращаемся
             tr._batch = lambda texts, context=(): [None] * len(texts)
         t0 = [0.0]
 
         def plan(total, cached, chars):
             t0[0] = time.time()
-            if P.get("cached_only"):
+            if CACHED_ONLY:
                 return
             left = total - cached
             msg = f"📊 Абзацев: {total}, уже переведено раньше: {cached}, осталось: {left} (~{chars // 1000} тыс. иероглифов)."
@@ -333,6 +366,10 @@ def main():
         tr.on_plan = plan
         missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=tprogress)
         print("OpenRouter:", tr.usage.summary(), file=sys.stderr)
+        if ALT and (missed or any(b2e.HAN.search(o) and t == o for ch, src in zip(book["chapters"], orig)
+                                  for o, t in zip(src, ch["paras"]))):
+            raise b2e.FatalError("Перевода этой книги больше нет в кэше, поэтому второй формат бесплатно не собрать. "
+                                 "Пришлите книгу ещё раз со словом «" + ALT + "» — переведу заново.")
         if P.get("cached_only"):
             trim_to_translated(book, orig, "Готовая часть перевода")
             missed = 0
@@ -416,7 +453,7 @@ def main():
                 "title_literal": c.get("title_literal"), "title_pinyin": c.get("title_pinyin")}
         saved = save_to_library(file_ids[0], file_ids=file_ids, title=book["title"], orig_title=orig_title,
                                 mode=mode, chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
-                                request=request, info={k: v for k, v in info.items() if v})
+                                request=request, info={k: v for k, v in info.items() if v}, format=fmt)
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 
