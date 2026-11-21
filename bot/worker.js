@@ -622,7 +622,7 @@ const otherFormat = (f) => f === "fb2" ? "epub" : "fb2";
 function canConvert(rec) {
   const other = otherFormat(recFormat(rec));
   if (rec.alt && rec.alt[other]) return true;
-  if (rec.mode === "lib") return !!rec.file_id && !(rec.size > 20 * 1024 * 1024);
+  if (rec.mode === "lib") return !!rec.file_id && !rec.unreadable && !(rec.size > 20 * 1024 * 1024);
   return !!(rec.req && (rec.req.url || rec.req.file_id) && BUTTONS[rec.req.mode]);
 }
 
@@ -795,11 +795,13 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
   const old = await env.BOOKS.get("book:" + key, "json");
   if (old) return reply(`📚 «${old.title}» уже есть в библиотеке.`);
 
-  const fileTitle = String(doc.file_name || "book.epub").replace(/\.(epub|fb2|fb2\.zip)$/i, "").replace(/[_]+/g, " ").trim();
+  const fileTitle = String(doc.file_name || "book.epub").replace(/\.(epub|fb2|fb2\.zip)$/i, "").replace(/[_]+/g, " ")
+    .replace(/[\s.-]+(rulit|litres|flibusta|litmir|royallib|coollib)(\.\w+)?$/i, "").trim();
   let meta = {};
   if (doc.file_size <= 20 * 1024 * 1024) {
     try { meta = await inspectEpub(env, doc.file_id); } catch (e) { console.log("epub meta", e && e.stack || e); }
   }
+  if (meta.error) console.log("getFile", doc.file_name, doc.file_size, meta.error);
   // Пока модель не составила описание, хотя бы убираем подчёркивания из «Dolgaya_igra».
   for (const k of ["title", "author"]) if (meta[k]) meta[k] = meta[k].replace(/_+/g, " ").trim();
   const title = meta.title || fileTitle || "Без названия";
@@ -812,6 +814,7 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
     names: [meta.author, fileTitle, ...(meta.alt || [])].filter(Boolean).map((x) => String(x).slice(0, 200)).slice(0, 12),
     info: cleanInfo({ author: meta.author, genre: meta.subject, synopsis: meta.description })
   };
+  if (meta.error) rec.unreadable = String(meta.error).slice(0, 200);
   if (meta.ok) {
     rec.cover = meta.cover ? 1 : 0;
     await putCover(env, key, meta.cover);
@@ -819,8 +822,10 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
   await putBook(env, key, rec);
   const text = `📥 Сохранено в библиотеку: «${title}»` + (meta.author ? `, ${meta.author}` : "") + sizeMb +
     (meta.cover ? " · 🖼 с обложкой" : "") +
+    (meta.error ? `\n⚠️ Telegram не отдаёт боту этот файл (${meta.error}), поэтому название взято из имени файла, ` +
+      "обложки нет, а описание и второй формат собрать не получится." : "") +
     "\nНайти потом: напишите название или автора, или /library.";
-  const canDescribe = doc.file_size <= 20 * 1024 * 1024 && env.GH_TOKEN && env.GH_REPO;
+  const canDescribe = doc.file_size <= 20 * 1024 * 1024 && !meta.error && env.GH_TOKEN && env.GH_REPO;
   const sent = await reply(text + (canDescribe ? "\n📝 Составляю описание…" : ""));
   const statusId = sent && sent.result && sent.result.message_id;
   if (canDescribe && !await describeBook(env, chat, key, rec, statusId, text) && statusId)
@@ -867,7 +872,8 @@ async function onInfo(env, request) {
 async function inspectEpub(env, file_id) {
   const f = await tg(env, "getFile", { file_id });
   if (!f) throw new Error("Telegram не ответил");
-  if (!f.ok) return { ok: true };  // например, файл больше 20 МБ
+  // Telegram может не отдать файл боту (например, «file is too big»): тогда ни названия, ни обложки не достать.
+  if (!f.ok) return { ok: true, error: f.description || "Telegram не отдал файл" };
   const r = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${f.result.file_path}`);
   if (!r.ok) throw new Error("скачивание: " + r.status);
   const buf = new Uint8Array(await r.arrayBuffer());
@@ -1069,7 +1075,7 @@ async function onApi(env, request, url) {
     return json({ title: rec.title, orig_title: rec.orig_title, mode: rec.mode, chapters: rec.chapters, date: rec.date,
       names: rec.names || [], info: rec.info || {}, cover: rec.cover,
       rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib"),
-      describe: rec.mode === "lib" && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described,
+      describe: rec.mode === "lib" && !rec.unreadable && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described,
       format: recFormat(rec), other: canConvert(rec) ? otherFormat(recFormat(rec)) : null,
       other_ready: !!(rec.alt && rec.alt[otherFormat(recFormat(rec))]) });
   }

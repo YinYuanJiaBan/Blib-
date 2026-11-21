@@ -60,7 +60,12 @@ def tg(method, **params):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read()).get("result")
     except Exception as e:  # noqa: BLE001 — статус в чате не должен ронять сборку
-        print(f"Telegram {method}: {getattr(e, 'code', '')} {type(e).__name__}", file=sys.stderr)
+        detail = ""
+        try:  # Telegram объясняет ошибку в теле ответа: «file is too big», «wrong file_id» и т. п.
+            detail = json.loads(e.read()).get("description", "")
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"Telegram {method}: {getattr(e, 'code', '')} {type(e).__name__} {detail}".rstrip(), file=sys.stderr)
         return None
 
 
