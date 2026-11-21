@@ -31,7 +31,10 @@ jobs:
           restore-keys: book2epub-
 
       - name: Собрать и отправить книгу
-        run: python3 bot/job.py
+        # Pillow — для значка-обложки у файла в Telegram; без него книга соберётся и так.
+        run: |
+          python3 -m pip install -q --break-system-packages pillow || true
+          python3 bot/job.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
