@@ -35,6 +35,7 @@ jobs:
           # Необязательно: лимит расходов на одну книгу в долларах и провайдер OpenRouter (например, DeepSeek).
           TRANSLATE_BUDGET_USD: ${{ vars.TRANSLATE_BUDGET_USD }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
+          MAX_PART_CHARS: ${{ vars.MAX_PART_CHARS }}
 
       - uses: actions/cache/save@v4
         if: always()
