@@ -231,6 +231,21 @@ def load_from_epub(path, limit=None):
         for m in re.finditer(r"<item\b([^>]*)/?>", opf):
             attrs = dict(re.findall(r'([\w:-]+)="([^"]*)"', m.group(1)))
             manifest[attrs.get("id")] = attrs
+        cover = None
+        meta_cover = re.search(r'<meta\b(?=[^>]*name="cover")[^>]*content="([^"]+)"', opf)
+        cands = [a for a in manifest.values() if "cover-image" in a.get("properties", "")]
+        if meta_cover and meta_cover.group(1) in manifest:
+            cands.append(manifest[meta_cover.group(1)])
+        cands += [a for a in manifest.values() if "cover" in (a.get("id", "") + a.get("href", "")).lower()
+                  and a.get("media-type", "").startswith("image/")]
+        for item in cands:
+            try:
+                data = z.read(posixpath.normpath(posixpath.join(base, urllib.parse.unquote(item["href"]))))
+            except KeyError:
+                continue
+            if image_type(data):
+                cover = data
+                break
         description, chapters = [], []
         for idref in re.findall(r'<itemref\b[^>]*idref="([^"]+)"', opf):
             item = manifest.get(idref)
@@ -248,7 +263,7 @@ def load_from_epub(path, limit=None):
             head = re.search(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", body, re.S | re.I)
             paras = [_xml_text(p) for p in re.findall(r"<p\b[^>]*>(.*?)</p>", body, re.S | re.I)]
             paras = [p for p in paras if p]
-            if re.search(r"(^|/)about\.xhtml$", item["href"]):  # справка о книге в наших EPUB
+            if re.search(r"(^|/)(about|cover)\.xhtml$", item["href"]):  # справка и обложка в наших EPUB
                 continue
             if re.search(r"(^|/)title\.xhtml$", item["href"]):  # титульная страница наших EPUB
                 description = paras
@@ -270,7 +285,34 @@ def load_from_epub(path, limit=None):
     author = meta("creator")
     return {"title": meta("title") or os.path.splitext(os.path.basename(path))[0],
             "author": "" if author == "—" else author, "description": description,
-            "chapters": chapters, "source": os.path.basename(path), "failed": []}
+            "chapters": chapters, "source": os.path.basename(path), "failed": [], "cover": cover}
+
+
+# ---------------------------------------------------------------- обложка
+IMAGE_TYPES = (("image/jpeg", "jpg", b"\xff\xd8\xff"), ("image/png", "png", b"\x89PNG"),
+               ("image/gif", "gif", b"GIF8"), ("image/webp", "webp", b"RIFF"))
+
+
+def image_type(data):
+    """(media-type, расширение) картинки по первым байтам или None, если это не JPEG/PNG/GIF/WebP."""
+    for media, ext, magic in IMAGE_TYPES:
+        if data and data.startswith(magic) and (ext != "webp" or data[8:12] == b"WEBP"):
+            return media, ext
+    return None
+
+
+def make_thumbnail(data, size=320):
+    """Маленькая JPEG-копия обложки (для значка файла в Telegram). Нужен Pillow; без него — None."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.thumbnail((size, size))
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=85)
+        return out.getvalue() if out.tell() <= 200 * 1024 else None
+    except Exception:  # noqa: BLE001 — нет Pillow или картинка не читается: обойдёмся без значка
+        return None
 
 
 # ---------------------------------------------------------------- перевод
@@ -512,7 +554,7 @@ class OpenRouterTranslator(BaseTranslator):
     context_items = 2
 
     def __init__(self, cache, api_key, model=DEFAULT_MODEL, book_title="", glossary="", card=None, notes=True,
-                 budget=None):
+                 budget=None, title=None):
         super().__init__(cache)
         if not api_key:
             raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
@@ -527,6 +569,10 @@ class OpenRouterTranslator(BaseTranslator):
         full = merge_glossary(card_glossary(card) if card else "", glossary)
         self.glossary = parse_glossary(full)
         self.glossary_text = full
+        if title and book_title:
+            # Своё название книги идёт только в глоссарий пакетов, где оно встречается, но не в ключ кэша:
+            # так смена названия у готовой книги не требует платить за перевод заново.
+            self.glossary[book_title] = title
         try:
             import legacy_prompts as old
             self.legacy = ("tr:" + hashlib.sha1(f"openrouter:{self.model}:{old.system(book_title, card, full, notes)}"
@@ -730,6 +776,19 @@ def apply_user_glossary(card, user):
     return card
 
 
+def apply_title(card, orig_title, title):
+    """Своё русское название книги: в справку и в её список терминов (глоссарий).
+    Возвращает копию справки; название, предложенное нейросетью, остаётся в title_ai."""
+    card = json.loads(json.dumps(card or {}, ensure_ascii=False))
+    if card.get("title_ru") and card["title_ru"] != title:
+        card["title_ai"] = card["title_ru"]
+    card["title_ru"] = title
+    if orig_title and orig_title != title:
+        card["terms"] = [{"zh": orig_title, "ru": title, "note": "название книги"}] + \
+            [t for t in card.get("terms", []) if t.get("zh") != orig_title]
+    return card
+
+
 def card_brief(card):
     """Справка в коротком виде для системного промпта переводчика."""
     lines = ["Справка о книге (для понимания контекста, не переводи её):"]
@@ -751,6 +810,8 @@ def format_card(card, orig_title="", orig_author=""):
     out = ["📚 Справка о книге", ""]
     title = card.get("title_ru") or orig_title
     out.append(f"Название: {title}")
+    if card.get("title_ai"):
+        out.append(f"(ваше название; нейросеть предлагала «{card['title_ai']}»)")
     if orig_title:
         out.append(f"Оригинал: {orig_title}" + (f" ({card['title_pinyin']})" if card.get("title_pinyin") else ""))
     if card.get("title_literal") and card["title_literal"] != title:
@@ -778,7 +839,8 @@ def format_card(card, orig_title="", orig_author=""):
     out += ["", "ℹ️ Справку составила нейросеть " +
             ("по своим знаниям о книге и её первым главам." if card.get("known")
              else "только по первым главам: книгу она не узнала, сюжет описан по началу.") +
-            " Эти имена будут использованы в переводе. Поправить имя: добавьте к ссылке строку «顾茫 = Гу Ман»."]
+            " Эти имена будут использованы в переводе. Поправить имя: добавьте к ссылке строку «顾茫 = Гу Ман»;"
+            " название книги можно поменять кнопкой «✏️ Изменить»."]
     return "\n".join(out)
 
 
@@ -924,6 +986,8 @@ sup{font-size:.7em;line-height:0}
 sup a{text-decoration:none}
 hr.notes{margin:2em 30% 1em 0;border:0;border-top:1px solid #999}
 p.note{text-indent:0;font-size:.88em;margin-bottom:.6em}
+div.cover{text-align:center;margin:0;padding:0}
+div.cover img{max-width:100%;max-height:100vh}
 """
 
 
@@ -1014,6 +1078,17 @@ def build_epub(path, book, lang):
     manifest = "\n".join(
         f'<item id="{i}" href="{h}" media-type="application/xhtml+xml"/>' for i, h, _, _ in files)
     spine = "\n".join(f'<itemref idref="{i}"/>' for i, _, _, _ in files)
+    cover = book.get("cover")
+    kind = image_type(cover) if cover else None
+    cover_meta, cover_page = "", None
+    if kind:
+        img = f"cover.{kind[1]}"
+        cover_page = xhtml(book["title"], f'<div class="cover"><img src="{img}" alt="{esc(book["title"])}"/></div>', lang)
+        manifest = (f'<item id="cover-img" href="{img}" media-type="{kind[0]}" properties="cover-image"/>\n'
+                    f'<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>\n' + manifest)
+        spine = '<itemref idref="cover"/>\n' + spine
+        cover_meta = '\n<meta name="cover" content="cover-img"/>'
+
     opf = f"""<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid" xml:lang="{lang}">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -1022,7 +1097,7 @@ def build_epub(path, book, lang):
 <dc:creator>{esc(book["author"] or "—")}</dc:creator>
 <dc:language>{lang}</dc:language>
 <dc:source>{esc(book["source"])}</dc:source>
-<meta property="dcterms:modified">{now}</meta>
+<meta property="dcterms:modified">{now}</meta>{cover_meta}
 </metadata>
 <manifest>
 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
@@ -1061,6 +1136,9 @@ def build_epub(path, book, lang):
             z.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
         for _, h, _, content in files:
             z.writestr(f"OEBPS/{h}", content, compress_type=zipfile.ZIP_DEFLATED)
+        if cover_page:
+            z.writestr(f"OEBPS/cover.{kind[1]}", cover, compress_type=zipfile.ZIP_STORED)
+            z.writestr("OEBPS/cover.xhtml", cover_page, compress_type=zipfile.ZIP_DEFLATED)
 
 
 def safe_filename(s):
@@ -1081,6 +1159,8 @@ def main():
     ap.add_argument("--bilingual", action="store_true", help="с --translate: оригинал над каждым абзацем перевода")
     ap.add_argument("--lang", default="ru", help="язык перевода для Google (по умолчанию ru)")
     ap.add_argument("--limit", type=int, help="взять только первые N глав")
+    ap.add_argument("--title", help="своё название книги (в переводе — вместо предложенного нейросетью)")
+    ap.add_argument("--cover", help="картинка для обложки (JPG, PNG, GIF или WebP)")
     ap.add_argument("--workers", type=int, default=4, help="параллельных загрузок (по умолчанию 4)")
     ap.add_argument("--delay", type=float, default=0.3, help="пауза между запросами к сайту, сек")
     ap.add_argument("--max-chars", type=int, default=MAX_PART_CHARS,
@@ -1104,6 +1184,11 @@ def main():
         print(f"  внимание: не загрузились главы ({len(book['failed'])}): {', '.join(book['failed'][:5])}…")
 
     orig_title = book["title"]
+    if args.cover:
+        with open(args.cover, "rb") as f:
+            book["cover"] = f.read()
+        if not image_type(book["cover"]):
+            raise FatalError("обложка должна быть картинкой JPG, PNG, GIF или WebP")
     lang = "zh"
     if args.translate:
         if args.engine == "openrouter":
@@ -1111,13 +1196,16 @@ def main():
             key = os.environ.get("OPENROUTER_API_KEY", "")
             try:
                 book["card"] = apply_user_glossary(make_card(book, cache, key, args.model), glossary)
-                print(format_card(book["card"], orig_title, book["author"]))
             except FatalError:
                 raise
             except Exception as e:  # noqa: BLE001 — без справки перевод всё равно возможен
                 print(f"  справка не составлена: {e}")
             tr = OpenRouterTranslator(cache, key, args.model, orig_title, glossary, book.get("card"),
-                                      notes=not args.no_notes)
+                                      notes=not args.no_notes, title=args.title)
+            if args.title:
+                book["card"] = apply_title(book.get("card"), orig_title, args.title)
+            if book.get("card"):
+                print(format_card(book["card"], orig_title, book["author"]))
             lang = "ru"
         else:
             tr = GoogleTranslator(cache, args.lang)
@@ -1126,7 +1214,9 @@ def main():
         if missed:
             print(f"  не переведено фрагментов: {missed} — запустите ещё раз, чтобы допереводить")
 
-    out = args.output or safe_filename(orig_title + ("_" + lang if args.translate else "")) + ".epub"
+    if args.title:
+        book["orig_title"], book["title"] = orig_title, args.title
+    out = args.output or safe_filename(book["title"] + ("_" + lang if args.translate else "")) + ".epub"
     parts = split_book(book, args.max_chars, lang)
     for part in parts:
         name = part_filename(out, part) if len(parts) > 1 else out
