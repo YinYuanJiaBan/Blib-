@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Задача для GitHub Actions: собирает книгу (по ссылке или из присланного EPUB),
-при необходимости переводит через OpenRouter и отправляет EPUB в Telegram.
+Задача для GitHub Actions: собирает книгу (по ссылке или из присланного EPUB / FB2),
+при необходимости переводит через OpenRouter и отправляет EPUB или FB2 в Telegram.
 
 Параметры берутся из client_payload события repository_dispatch (для локальной проверки — из PAYLOAD):
   chat_id, status_id, mode ("orig" | "ru" | "bi"), url | file_id, file_name, limit, glossary,
   edit — {title, cover, thumb}: своё название книги и обложка (file_id картинки и её уменьшенной копии в Telegram),
+  format ("epub" | "fb2"; у файлов — edit.format): в каком формате прислать книгу; по умолчанию — как у
+  присланного файла, иначе epub. Передаётся, только если отличается: в client_payload не больше 10 полей,
   save — {url, key, sig}: куда сообщить о готовой книге, чтобы она попала в библиотеку бота
-Режим "describe": ничего не собирает, а составляет описание загруженного EPUB (название, автор, жанр,
+Режим "describe": ничего не собирает, а составляет описание загруженного EPUB / FB2 (название, автор, жанр,
 о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
 """
 import json
@@ -18,6 +20,7 @@ import time
 import traceback
 import urllib.request
 import uuid
+import zipfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "parser"))
 import book2epub as b2e  # noqa: E402
@@ -55,6 +58,9 @@ def tg(method, **params):
         return None
 
 
+MIME = {"epub": "application/epub+zip", "fb2": "application/x-fictionbook+xml"}
+
+
 def send_document(path, filename, caption, thumb=None):
     boundary = uuid.uuid4().hex
     parts = []
@@ -67,7 +73,7 @@ def send_document(path, filename, caption, thumb=None):
         data = f.read()
     fn = filename.replace('"', "")
     parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{fn}"\r\n'
-                  f"Content-Type: application/epub+zip\r\n\r\n").encode() + data + b"\r\n")
+                  f"Content-Type: {MIME['fb2' if filename.lower().endswith('.fb2') else 'epub']}\r\n\r\n").encode() + data + b"\r\n")
     if thumb:
         parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="thumb"; filename="thumb.jpg"\r\n'
                       f"Content-Type: image/jpeg\r\n\r\n").encode() + thumb + b"\r\n")
@@ -153,11 +159,15 @@ def download(file_id, max_bytes=20 * 1024 * 1024):
         return r.read(max_bytes + 1)
 
 
-def download_epub(tmp):
-    src = os.path.join(tmp, "in.epub")
+def load_upload(tmp, limit=None):
+    """Скачивает присланный EPUB или FB2 (.fb2.zip) и читает его."""
+    src = os.path.join(tmp, "in" + (".fb2" if b2e.is_fb2(P.get("file_name")) else ".epub"))
     with open(src, "wb") as f:
         f.write(download(P["file_id"]))
-    return src
+    try:
+        return b2e.load_from_file(src, limit)
+    except (ValueError, KeyError, zipfile.BadZipFile) as e:
+        raise b2e.FatalError(f"Не удалось прочитать файл: {e}") from None
 
 
 def user_cover(edit):
@@ -203,7 +213,7 @@ def describe():
         return done("📝 Описание не составлено: не задан ключ OpenRouter.")
     tmp = tempfile.mkdtemp()
     try:
-        book = b2e.load_from_epub(download_epub(tmp), limit=8)
+        book = load_upload(tmp, limit=8)
     except Exception as e:  # noqa: BLE001 — нет текста, битый файл и т. п.
         print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
         return done("📝 Описание не составлено: не получилось прочитать текст книги.")
@@ -246,7 +256,7 @@ def main():
     cover, thumb = user_cover(edit)
 
     if P.get("file_id"):
-        book = b2e.load_from_epub(download_epub(tmp), limit)
+        book = load_upload(tmp, limit)
         book["source"] = P.get("file_name") or "book.epub"
         head = book
     else:
@@ -334,15 +344,17 @@ def main():
 
     if title:
         book["orig_title"], book["title"] = orig_title, title
-    status("📦 Собираю EPUB…", force=True)
+    fmt = P.get("format") or edit.get("format") or ("fb2" if b2e.is_fb2(P.get("file_name")) else "epub")
+    fmt = fmt if fmt in ("epub", "fb2") else "epub"
+    status(f"📦 Собираю {fmt.upper()}…", force=True)
     suffix = {"orig": "", "ru": "_ru", "bi": "_zh-ru"}[mode]
-    name = b2e.safe_filename(book["title"]) + suffix + ".epub"
+    name = b2e.safe_filename(book["title"]) + suffix + "." + fmt
     # Длинная книга (больше 140 тыс. знаков китайского текста) делится на несколько томов.
     parts = b2e.split_book(book, int(os.environ.get("MAX_PART_CHARS") or b2e.MAX_PART_CHARS), lang)
     outs = []
     for k, part in enumerate(parts, 1):
-        out = os.path.join(tmp, f"book_{k}.epub")
-        b2e.build_epub(out, part, lang)
+        out = os.path.join(tmp, f"book_{k}.{fmt}")
+        b2e.build_book(out, part, lang, fmt)
         outs.append((out, b2e.part_filename(name, part) if len(parts) > 1 else name, part))
 
     notes = []
@@ -394,7 +406,8 @@ def main():
         names.append(book.get("author") or head.get("author"))
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
-        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes", "edit")
+        request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes", "edit",
+                                       "format")
                    if k in P}
         # Справка для карточки книги в мини-приложении.
         info = {"author": c.get("author_ru") or book.get("author") or head.get("author"),
