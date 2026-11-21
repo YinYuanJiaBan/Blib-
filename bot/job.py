@@ -26,6 +26,9 @@ def _payload():
     # В Actions параметры читаются из файла события: так они не попадают в публичный журнал запуска.
     if os.environ.get("PAYLOAD"):
         return json.loads(os.environ["PAYLOAD"])
+    if os.environ.get("PAYLOAD_FILE"):
+        with open(os.environ["PAYLOAD_FILE"], encoding="utf-8") as f:
+            return json.load(f)
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as f:
         return json.load(f).get("client_payload") or {}
 
@@ -94,6 +97,25 @@ def bar(done, total, width=12):
     return "▓" * filled + "░" * (width - filled) + f" {done}/{total}"
 
 
+def cached_part(book, tr, mode):
+    """Только то, что уже переведено и лежит в кэше: к модели не обращаемся.
+    В книгу идут главы с начала, переведённые целиком; на первой непереведённой книга обрывается."""
+    tr._batch = lambda texts, context=(): [None] * len(texts)
+    orig = [list(ch["paras"]) for ch in book["chapters"]]
+    b2e.translate_book(book, tr, bilingual=(mode == "bi"))
+    keep = []
+    for ch, src in zip(book["chapters"], orig):
+        if any(b2e.HAN.search(o) and t == o for o, t in zip(src, ch["paras"])):
+            break
+        keep.append(ch)
+    total = len(book["chapters"])
+    book["chapters"] = keep
+    book["partial_note"] = f"Готовая часть перевода: глав {len(keep)} из {total}"
+    if not keep:
+        raise b2e.FatalError("В кэше нет ни одной полностью переведённой главы.")
+    return 0
+
+
 def main():
     if not TOKEN or not CHAT:
         sys.exit("Нет TELEGRAM_BOT_TOKEN или chat_id")
@@ -133,7 +155,8 @@ def main():
         status("🔎 Составляю справку о книге…", force=True)
         try:
             card = b2e.apply_user_glossary(b2e.make_card(head, cache, api_key, model), glossary)
-            send_text(b2e.format_card(card, head["title"], head.get("author", "")))
+            if not P.get("cached_only"):
+                send_text(b2e.format_card(card, head["title"], head.get("author", "")))
         except b2e.FatalError:
             if mode != "orig":
                 raise
@@ -152,7 +175,10 @@ def main():
     if mode in ("ru", "bi"):
         tr = b2e.OpenRouterTranslator(cache, api_key, model, orig_title, glossary, card,
                                       notes=P.get("notes") is not False)
-        missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
+        if P.get("cached_only"):
+            missed = cached_part(book, tr, mode)
+        else:
+            missed = b2e.translate_book(book, tr, bilingual=(mode == "bi"), progress=progress)
         lang = "ru"
 
     status("📦 Собираю EPUB…", force=True)
@@ -166,6 +192,8 @@ def main():
         notes.append(f"⚠️ не загрузились главы: {len(book['failed'])}")
     if missed:
         notes.append(f"⚠️ не переведено фрагментов: {missed} (пришлите задачу ещё раз — допереведу)")
+    if book.get("partial_note"):
+        notes.append("✂️ " + book["partial_note"])
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
     if notes:
         caption += "\n" + "\n".join(notes)

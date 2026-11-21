@@ -1,0 +1,32 @@
+name: Готовая часть перевода
+
+# Собирает EPUB только из уже переведённого (кэш прошлых запусков), без запросов к модели,
+# и отправляет его в Telegram. Запускается, когда в ветку кладут bot/partial.json:
+#   {"chat_id": 123, "url": "https://www.kanunu8.com/...", "mode": "ru", "cached_only": true}
+on:
+  push:
+    paths: [bot/partial.json]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: .book2epub_cache
+          key: book2epub-partial-${{ github.run_id }}
+          restore-keys: book2epub-
+
+      - name: Собрать и отправить готовую часть
+        run: python3 bot/job.py
+        env:
+          PAYLOAD_FILE: bot/partial.json
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
