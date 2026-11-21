@@ -240,8 +240,13 @@ def main():
     status("📦 Собираю EPUB…", force=True)
     suffix = {"orig": "", "ru": "_ru", "bi": "_zh-ru"}[mode]
     name = b2e.safe_filename((book["title"] if mode != "orig" else orig_title)) + suffix + ".epub"
-    out = os.path.join(tmp, "book.epub")
-    b2e.build_epub(out, book, lang)
+    # Длинная книга (больше 140 тыс. знаков китайского текста) делится на несколько томов.
+    parts = b2e.split_book(book, int(os.environ.get("MAX_PART_CHARS") or b2e.MAX_PART_CHARS), lang)
+    outs = []
+    for k, part in enumerate(parts, 1):
+        out = os.path.join(tmp, f"book_{k}.epub")
+        b2e.build_epub(out, part, lang)
+        outs.append((out, b2e.part_filename(name, part) if len(parts) > 1 else name, part))
 
     notes = []
     if book["failed"]:
@@ -254,21 +259,35 @@ def main():
         notes.append("💰 " + usage_note)
     n = len(book["chapters"])
     caption = f"📖 {book['title']}" + (f" ({orig_title})" if book["title"] != orig_title else "") + f"\nГлав: {n}"
+    if len(parts) > 1:
+        n_parts = len(parts)
+        word = "книги" if n_parts % 10 in (2, 3, 4) and n_parts % 100 not in (12, 13, 14) else "книг"
+        caption += f"\n📚 Разбита на {n_parts} {word} — длиннее {b2e.MAX_PART_CHARS // 1000} тыс. знаков"
     if notes:
         caption += "\n" + "\n".join(notes)
+
+    def part_caption(k, part):
+        if len(parts) == 1:
+            return caption
+        head = f"📕 Книга {k} из {len(parts)}: главы {part['chapters'][0]['title']} — {part['chapters'][-1]['title']}"
+        return (caption + "\n" + head) if k == len(parts) else head
+
     if os.environ.get("OUT_DIR"):
         import shutil
         os.makedirs(os.environ["OUT_DIR"], exist_ok=True)
-        shutil.copy(out, os.path.join(os.environ["OUT_DIR"], name))
+        for out, fname, _ in outs:
+            shutil.copy(out, os.path.join(os.environ["OUT_DIR"], fname))
         with open(os.path.join(os.environ["OUT_DIR"], "caption.txt"), "w", encoding="utf-8") as f:
             f.write(caption)
         return
-    sent = send_document(out, name, caption[:1000])
+    file_ids = []
+    for k, (out, fname, part) in enumerate(outs, 1):
+        sent = send_document(out, fname, part_caption(k, part)[:1000])
+        file_ids.append((((sent or {}).get("result") or {}).get("document") or {}).get("file_id"))
     saved = False
     # Неполную книгу не сохраняем: повторный запрос её допереведёт.
     complete = not book["failed"] and not missed and not book.get("partial_note") and not P.get("cached_only")
-    if complete:
-        doc = ((sent or {}).get("result") or {}).get("document") or {}
+    if complete and all(file_ids):
         c = card or {}
         # Без строки о расходах: при повторной выдаче из библиотеки за перевод уже не платят.
         lib_caption = "\n".join(x for x in caption.split("\n") if not x.startswith("💰"))
@@ -277,8 +296,8 @@ def main():
         if P.get("file_name"):
             names.append(os.path.splitext(P["file_name"])[0])
         request = {k: P[k] for k in ("mode", "url", "file_id", "file_name", "limit", "glossary", "notes") if k in P}
-        saved = save_to_library(doc.get("file_id"), title=book["title"], orig_title=orig_title, mode=mode,
-                                chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
+        saved = save_to_library(file_ids[0], file_ids=file_ids, title=book["title"], orig_title=orig_title,
+                                mode=mode, chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
                                 request=request)
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
