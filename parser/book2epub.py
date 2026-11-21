@@ -292,7 +292,7 @@ class Usage:
 
     def __init__(self):
         self.lock = threading.Lock()
-        self.calls = self.prompt = self.cached = self.completion = 0
+        self.calls = self.prompt = self.cached = self.completion = self.reasoning = 0
         self.cost = 0.0
 
     def add(self, u):
@@ -301,13 +301,15 @@ class Usage:
             self.prompt += int(u.get("prompt_tokens") or 0)
             self.cached += int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
             self.completion += int(u.get("completion_tokens") or 0)
+            self.reasoning += int((u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
             self.cost += float(u.get("cost") or 0)
 
     def summary(self):
         def num(x):
             return f"{x:,}".replace(",", " ")
         cached = f" (из кэша {100 * self.cached // self.prompt}%)" if self.prompt else ""
-        return (f"запросов {self.calls}, токенов: вход {num(self.prompt)}{cached}, выход {num(self.completion)}, "
+        return (f"запросов {self.calls}, токенов: вход {num(self.prompt)}{cached}, выход {num(self.completion)}"
+                + (f" (размышления {num(self.reasoning)})" if self.reasoning else "") + ", "
                 f"≈${self.cost:.2f}")
 
 
@@ -418,16 +420,24 @@ def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300, usag
     if not api_key:
         raise FatalError("Не задан ключ OpenRouter (переменная OPENROUTER_API_KEY).")
     body = {"model": model, "temperature": temperature, "messages": messages, "usage": {"include": True}}
+    # Перевод не требует «размышлений»: у моделей с рассуждениями они съедают большую часть токенов и времени.
+    if os.environ.get("OPENROUTER_REASONING", "off").lower() in ("off", "0", "no", "false", ""):
+        body["reasoning"] = {"enabled": False, "exclude": True}
     provider = os.environ.get("OPENROUTER_PROVIDER", "").strip()
     if provider:  # закрепить провайдера, у которого работает кэширование промпта
         body["provider"] = {"order": [p.strip() for p in provider.split(",") if p.strip()], "allow_fallbacks": True}
     payload = json.dumps(body).encode()
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
                "HTTP-Referer": "https://github.com/", "X-Title": "book2epub"}
+    t0 = time.time()
     try:
         data = json.loads(fetch(OPENROUTER_URL, data=payload, headers=headers, retries=1, timeout=timeout))
     except urllib.error.HTTPError as e:
         msg = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 400 and "reasoning" in body and "reason" in msg.lower():
+            # модель не умеет отключать рассуждения — повторяем без этого параметра
+            os.environ["OPENROUTER_REASONING"] = "on"
+            return openrouter_chat(api_key, model, messages, temperature, timeout, usage)
         if e.code == 401:
             raise FatalError("OpenRouter не принял ключ. Проверьте OPENROUTER_API_KEY.") from None
         if e.code == 402:
@@ -435,8 +445,13 @@ def openrouter_chat(api_key, model, messages, temperature=0.3, timeout=300, usag
         if e.code in (400, 404):
             raise FatalError(f"OpenRouter отклонил запрос (проверьте модель «{model}»): {msg}") from None
         raise RuntimeError(f"HTTP {e.code}: {msg}") from None
-    if usage is not None and data.get("usage"):
-        usage.add(data["usage"])
+    u = data.get("usage") or {}
+    if usage is not None and u:
+        usage.add(u)
+    if u:
+        rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+        print(f"  запрос: {time.time() - t0:.0f} с, вход {u.get('prompt_tokens')}, выход {u.get('completion_tokens')}"
+              + (f" (из них размышления {rt})" if rt else ""), file=sys.stderr, flush=True)
     if data.get("error"):
         raise RuntimeError(data["error"].get("message", "ошибка модели"))
     return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
