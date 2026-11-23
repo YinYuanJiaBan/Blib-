@@ -68,6 +68,7 @@ export default {
         { command: "help", description: "Как пользоваться" },
         { command: "library", description: "Сохранённые книги" },
         { command: "upload", description: "Режим загрузки готовых EPUB и FB2 в библиотеку" },
+        { command: "describe_all", description: "Описать загруженные книги заново" },
         { command: "id", description: "Мой Telegram ID" }
       ] });
       const check = [
@@ -91,6 +92,7 @@ export default {
     // Сюда задача из GitHub Actions сообщает о готовой книге, чтобы сохранить её в библиотеке.
     if (url.pathname === "/saved" && request.method === "POST") return onSaved(env, request);
     if (url.pathname === "/info" && request.method === "POST") return onInfo(env, request);
+    if (url.pathname === "/describe-list" && request.method === "POST") return onDescribeList(env, request);
 
     if (url.pathname === "/webhook" && request.method === "POST") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET)
@@ -158,6 +160,10 @@ async function onMessage(env, msg) {
     return q ? findBooks(env, chat, q) : showLibrary(env, chat);
   }
   if (text.startsWith("/upload")) return toggleUpload(env, chat);
+  if (text.startsWith("/describe_all")) {
+    const r = await describeAll(env, chat);
+    return r === true ? null : say(env, chat, r);
+  }
 
   // Ответ на вопрос бота «напишите название» / «пришлите обложку».
   const r = msg.reply_to_message;
@@ -1063,6 +1069,44 @@ async function describeBook(env, chat_id, key, rec, statusId, statusText) {
     describe: { url: ORIGIN + "/info", key, sig: await sign(env, key) } }, true);
 }
 
+// ---------------------------------------------------------------- описать все загруженные книги заново
+// Какие книги описывать: загруженные готовыми файлами (переводы бота пропускаем — у них справка
+// уже есть) и ещё не описанные этой версией (без числа знаков). Файлы больше 20 МБ боту не скачать.
+const needsDescribe = (m) => m && m.m === "lib" && !m.ch;
+
+async function describeAll(env, chat_id) {
+  if (!env.BOOKS) return "Библиотека не подключена: у воркера нет KV-хранилища BOOKS.";
+  if (!env.GH_TOKEN || !env.GH_REPO) return "Не удалось запустить: проверьте GH_TOKEN и GH_REPO.";
+  if (await env.BOOKS.get("describe-all:" + chat_id)) return "Описание книг уже идёт — прогресс в чате с ботом.";
+  const n = (await listBooks(env)).filter((k) => needsDescribe(k.metadata)).length;
+  if (!n) return "Все загруженные книги уже описаны.";
+  const st = await say(env, chat_id, `📝 Описываю загруженные книги: ${n}. Переводы бота пропускаю. Задача запускается…`);
+  const sig = hex(await hmac(env.WEBHOOK_SECRET, "describe-all"));
+  const ok = await dispatch(env, chat_id, { mode: "describe_all", chat_id,
+    status_id: st && st.result && st.result.message_id, list: { url: ORIGIN + "/describe-list", sig } });
+  if (!ok) return "Ошибка запуска";
+  await env.BOOKS.put("describe-all:" + chat_id, "1", { expirationTtl: 600 });  // от двойного нажатия
+  return true;
+}
+
+// Задача describe_all забирает здесь список книг, по одной подписи на каждую — для /info.
+async function onDescribeList(env, request) {
+  if (!env.BOOKS) return new Response("no storage", { status: 501 });
+  const b = await request.json().catch(() => null);
+  if (!b || b.sig !== hex(await hmac(env.WEBHOOK_SECRET, "describe-all"))) return new Response("forbidden", { status: 403 });
+  const books = [];
+  // От старых к новым: первой описывается книга, загруженная раньше, — к ней и привяжутся другие переводы.
+  for (const k of [...await listBooks(env)].reverse()) {
+    if (!needsDescribe(k.metadata) || books.length >= 500) continue;
+    const rec = await env.BOOKS.get(k.name, "json");
+    if (!rec || !rec.file_id || rec.size > 20 * 1024 * 1024) continue;
+    const key = k.name.slice(5);
+    books.push({ key, sig: await sign(env, key), url: ORIGIN + "/info", file_id: rec.file_id,
+      file_name: rec.file_name || "book.epub", title: rec.title || "" });
+  }
+  return json({ books });
+}
+
 async function onInfo(env, request) {
   if (!env.BOOKS) return new Response("no storage", { status: 501 });
   const b = await request.json().catch(() => null);
@@ -1336,6 +1380,10 @@ async function onApi(env, request, url) {
       stale: items.filter((k) => (k.metadata || {}).v !== META_V).length,
       books: items.map((k) => ({ k: k.name.slice(5), ...(k.metadata || {}) })) });
   }
+  if (route === "describe-all" && request.method === "POST") {
+    const r = await describeAll(env, user.id);
+    return r === true ? json({ ok: true }) : json({ error: r }, 400);
+  }
   // Книги, сохранённые до жанров и серий: дописываем им метаданные (авторы, жанры, серия, переводчик).
   if (route === "reindex" && request.method === "POST") {
     const items = await listBooks(env);
@@ -1520,6 +1568,9 @@ header.scrolled { border-bottom-color: var(--sep); }
 .rows .main small { display: block; color: var(--hint); font-size: 12px; }
 .rows .end { flex: none; color: var(--hint); font-size: 13px; }
 .rows .go { color: var(--link); }
+.bulk { display: block; margin: 0 16px 32px; padding: 12px 14px; width: calc(100% - 32px); border-radius: 12px;
+  background: var(--bg2); color: var(--link); text-align: left; }
+.bulk small { display: block; color: var(--hint); font-size: 12px; margin-top: 2px; }
 .fmt { display: inline-block; font-size: 11px; padding: 1px 5px; border-radius: 4px; margin-left: 4px;
   border: 0.5px solid var(--sep); color: var(--hint); }
 
@@ -1608,6 +1659,7 @@ header.scrolled { border-bottom-color: var(--sep); }
 </header>
 <div id="crumb"></div>
 <main class="grid" id="grid"></main>
+<div id="bulk"></div>
 
 <section class="sheet" id="sheet" aria-hidden="true"></section>
 <div class="toast" id="toast"></div>
@@ -1819,8 +1871,30 @@ header.scrolled { border-bottom-color: var(--sep); }
     }).join("");
   }
 
+  // Кнопка «Описать загруженные книги заново»: только загруженные файлы, ещё не описанные этой версией.
+  // Переводы бота не трогаем — справка о них уже есть.
+  function renderBulk() {
+    var n = st.books.filter(function (b) { return b.m === "lib" && !b.ch; }).length;
+    $("bulk").innerHTML = n && st.view === "books" && !st.q ? '<button class="bulk" id="bulkBtn">📝 Описать загруженные книги заново · ' + n +
+      "<small>Название, автор, переводчик, жанр и объём текста — чтобы книги разложились по жанрам и нашлись другие " +
+      "переводы. Переводы бота пропускаются. Стоит доли цента за книгу.</small></button>" : "";
+  }
+
+  async function describeAll() {
+    var n = st.books.filter(function (b) { return b.m === "lib" && !b.ch; }).length;
+    if (!await confirmAsk("Описать заново загруженные книги (" + n + ")? Переводы бота пропускаются. " +
+      "Модель прочитает начало каждой книги — это доли цента за книгу.")) return;
+    try {
+      await api("/api/describe-all", {});
+      haptic("medium");
+      toast("Запущено — прогресс в чате с ботом");
+      $("bulk").innerHTML = "";
+    } catch (e) { toast(e.message); }
+  }
+
   function render() {
     var total = st.works.length;
+    renderBulk();
     $("crumb").innerHTML = "";
     if (!st.books.length) {
       $("count").textContent = plural(0, "книга", "книги", "книг");
@@ -2101,6 +2175,7 @@ header.scrolled { border-bottom-color: var(--sep); }
     var c = e.target.closest(".card[data-k]"); if (c) return openBook(c.getAttribute("data-k"));
     var f = e.target.closest(".folder[data-g]"); if (f) openGenre(f.getAttribute("data-g"));
   });
+  $("bulk").addEventListener("click", function (e) { if (e.target.closest("#bulkBtn")) describeAll(); });
   $("crumb").addEventListener("click", function (e) { if (e.target.closest("[data-back]")) goBack(); });
   $("tabs").addEventListener("click", function (e) {
     var t = e.target.closest("[data-v]"); if (t) { haptic(); setView(t.getAttribute("data-v")); }

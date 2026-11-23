@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ github.event.client_payload.mode == 'describe' && 10 || 340 }}
     env:
-      DESCRIBE: ${{ github.event.client_payload.mode == 'describe' }}
+      DESCRIBE: ${{ github.event.client_payload.mode == 'describe' || github.event.client_payload.mode == 'describe_all' }}
     steps:
       - uses: actions/checkout@v4
 

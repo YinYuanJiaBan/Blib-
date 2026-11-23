@@ -14,7 +14,10 @@
 Режим "convert": присланный готовый файл (file_id, file_name) переводится в формат save.alt без пересборки.
 Режим "describe": ничего не собирает, а составляет описание загруженного EPUB / FB2 (название, автор, жанр,
 о чём книга) и отправляет его в библиотеку по адресу из describe — {url, key, sig}.
+Режим "describe_all": то же для всех загруженных книг библиотеки по очереди; список книг (с подписями)
+задача берёт у воркера по адресу из list — {url, sig}.
 """
+import shutil
 import json
 import re
 import os
@@ -172,11 +175,12 @@ def download(file_id, max_bytes=20 * 1024 * 1024):
         return r.read(max_bytes + 1)
 
 
-def load_upload(tmp, limit=None):
+def load_upload(tmp, limit=None, file_id=None, file_name=None):
     """Скачивает присланный EPUB или FB2 (.fb2.zip) и читает его."""
-    src = os.path.join(tmp, "in" + (".fb2" if b2e.is_fb2(P.get("file_name")) else ".epub"))
+    file_name = file_name or P.get("file_name")
+    src = os.path.join(tmp, "in" + (".fb2" if b2e.is_fb2(file_name) else ".epub"))
     with open(src, "wb") as f:
-        f.write(download(P["file_id"]))
+        f.write(download(file_id or P["file_id"]))
     try:
         return b2e.load_from_file(src, limit)
     except (ValueError, KeyError, zipfile.BadZipFile) as e:
@@ -219,6 +223,34 @@ def post_json(url, body):
         return None
 
 
+def describe_one(file_id, file_name, dest, api_key, usage):
+    """Описание одной загруженной книги для библиотеки. (итог для пользователя, ответ воркера или None)."""
+    tmp = tempfile.mkdtemp()
+    try:
+        try:
+            book = load_upload(tmp, file_id=file_id, file_name=file_name)  # целиком: нужно число знаков
+        except Exception as e:  # noqa: BLE001 — нет текста, битый файл, Telegram не отдал файл и т. п.
+            print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
+            return "📝 Описание не составлено: не получилось прочитать текст книги.", None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    book["source"] = file_name or "book.epub"
+    card = b2e.describe_book(book, api_key, os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL, usage)
+    if not card:
+        return "📝 Описание не составлено: модель не ответила, попробуйте позже из библиотеки.", None
+    # Переводчик — из самого файла, если он там указан, иначе — что нашла модель.
+    card["translator"] = book.get("translator") or card.get("translator") or ""
+    card["chars"] = b2e.text_chars(book)
+    ok = post_json(dest["url"], {"key": dest.get("key"), "sig": dest.get("sig"), "card": card})
+    if ok is None:
+        return "📝 Описание составлено, но бот не смог его сохранить.", None
+    who = card.get("author") or card.get("author_orig")
+    return (f"📝 «{card.get('title') or book['title']}»" + (f", {who}" if who else "") +
+            (f" · {card['genre']}" if card.get("genre") else "") +
+            (f" · перевод: {card['translator']}" if card.get("translator") else "") +
+            " — описание добавлено в библиотеку." + ("\n" + ok["note"] if ok.get("note") else "")), ok
+
+
 def describe():
     """Описание загруженного EPUB для библиотеки: настоящее название, автор, жанр, о чём книга."""
     note = P.get("status_text") or ""
@@ -231,32 +263,54 @@ def describe():
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key or not dest.get("url"):
         return done("📝 Описание не составлено: не задан ключ OpenRouter.")
-    tmp = tempfile.mkdtemp()
-    try:
-        book = load_upload(tmp)  # целиком: по числу знаков узнаётся та же книга в другом переводе
-    except Exception as e:  # noqa: BLE001 — нет текста, битый файл и т. п.
-        print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
-        return done("📝 Описание не составлено: не получилось прочитать текст книги.")
-    book["source"] = P.get("file_name") or "book.epub"
     usage = b2e.Usage()
     try:
-        card = b2e.describe_book(book, api_key, os.environ.get("OPENROUTER_MODEL") or b2e.DEFAULT_MODEL, usage)
+        line, _ = describe_one(P.get("file_id"), P.get("file_name"), dest, api_key, usage)
     except b2e.FatalError as e:  # неверный ключ, нет денег и т. п.
         return done(f"📝 Описание не составлено: {e}"[:300])
     print("OpenRouter:", usage.summary(), file=sys.stderr)
-    if not card:
-        return done("📝 Описание не составлено: модель не ответила, попробуйте позже из библиотеки.")
-    # Переводчик — из самого файла, если он там указан, иначе — что нашла модель.
-    card["translator"] = book.get("translator") or card.get("translator") or ""
-    card["chars"] = b2e.text_chars(book)
-    ok = post_json(dest["url"], {"key": dest.get("key"), "sig": dest.get("sig"), "card": card})
-    if ok is None:
-        return done("📝 Описание составлено, но бот не смог его сохранить.")
-    who = card.get("author") or card.get("author_orig")
-    done(f"📝 «{card.get('title') or book['title']}»" + (f", {who}" if who else "") +
-         (f" · {card['genre']}" if card.get("genre") else "") +
-         (f" · перевод: {card['translator']}" if card.get("translator") else "") +
-         " — описание добавлено в библиотеку." + ("\n" + ok["note"] if ok.get("note") else ""))
+    done(line)
+
+
+def describe_all():
+    """Кнопка «Описать загруженные книги заново»: все загруженные книги по очереди. По очереди — чтобы каждая
+    следующая уже видела описанные и узнавала в них другой перевод той же книги."""
+    src = P.get("list") or {}
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key or not src.get("url"):
+        return status("❌ Описания не составлены: не задан ключ OpenRouter.", force=True)
+    books = (post_json(src["url"], {"sig": src.get("sig")}) or {}).get("books") or []
+    if not books:
+        return status("📝 Все загруженные книги уже описаны.", force=True)
+    n, usage = len(books), b2e.Usage()
+    ok_count, failed, notes, stop = 0, [], [], ""
+    status(f"📝 Описываю загруженные книги: {n}\n{bar(0, n)}", force=True)
+    for i, b in enumerate(books, 1):
+        title = b.get("title") or b.get("file_name") or "книга"
+        try:
+            line, ok = describe_one(b.get("file_id"), b.get("file_name"), b, api_key, usage)
+        except b2e.FatalError as e:  # неверный ключ, кончились деньги — дальше нет смысла
+            stop = f"⛔ Остановлено на книге {i} из {n}: {e}"[:300]
+            break
+        except Exception as e:  # noqa: BLE001 — одна книга не мешает остальным
+            print(f"Описание: {type(e).__name__}: {e}", file=sys.stderr)
+            ok = None
+        if ok is None:
+            failed.append(title)
+        else:
+            ok_count += 1
+            if ok.get("note"):
+                notes.append(f"«{title}»: " + ok["note"])
+        status(f"📝 Описываю загруженные книги: {i} из {n}\n{bar(i, n)}")
+    print("OpenRouter:", usage.summary(), file=sys.stderr)
+    lines = [f"✅ Описано книг: {ok_count} из {n}" + (f" · 💰 {usage.summary()}" if usage.calls else "")]
+    if stop:
+        lines.append(stop)
+    if failed:
+        lines.append("Не получилось (можно повторить кнопкой ещё раз): " + "; ".join(failed[:30]) +
+                     (f" и ещё {len(failed) - 30}" if len(failed) > 30 else ""))
+    status(lines[0] if not stop else stop, force=True)
+    send_text("\n".join(lines + notes))
 
 
 def convert():
@@ -281,6 +335,8 @@ def convert():
 def main():
     if P.get("mode") == "describe":
         return describe()
+    if P.get("mode") == "describe_all":
+        return describe_all()
     if P.get("mode") == "convert":
         return convert()
     if not os.environ.get("OUT_DIR") and (not TOKEN or not CHAT):
