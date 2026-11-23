@@ -1734,6 +1734,19 @@ header.scrolled { border-bottom-color: var(--sep); }
       if (!groups[id]) { groups[id] = []; order.push(id); }
       groups[id].push(b);
     });
+    // Одна и та же книга серии, загруженная несколько раз («Серия, книга 1» дважды) — одно произведение.
+    var bySeries = {};
+    order = order.filter(function (id) {
+      var r = groups[id].find(function (x) { return x.k === id; }) || groups[id][0];
+      if (!r.sr || !r.sn) return true;
+      var key = norm(r.sr) + "#" + r.sn;
+      var list = bySeries[key] || (bySeries[key] = []);
+      var into = list.find(function (o) { return sameAuthor(o.a, r.a); });
+      if (!into) { list.push({ id: id, a: r.a }); return true; }
+      groups[into.id] = groups[into.id].concat(groups[id]);
+      if (!into.a) into.a = r.a;
+      return false;
+    });
     st.byWork = {};
     st.works = order.map(function (id) {
       var m = groups[id];
