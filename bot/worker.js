@@ -1734,6 +1734,19 @@ header.scrolled { border-bottom-color: var(--sep); }
       if (!groups[id]) { groups[id] = []; order.push(id); }
       groups[id].push(b);
     });
+    // Одна и та же книга серии, загруженная несколько раз («Серия, книга 1» дважды) — одно произведение.
+    var bySeries = {};
+    order = order.filter(function (id) {
+      var r = groups[id].find(function (x) { return x.k === id; }) || groups[id][0];
+      if (!r.sr || !r.sn) return true;
+      var key = norm(r.sr) + "#" + r.sn;
+      var list = bySeries[key] || (bySeries[key] = []);
+      var into = list.find(function (o) { return sameAuthor(o.a, r.a); });
+      if (!into) { list.push({ id: id, a: r.a }); return true; }
+      groups[into.id] = groups[into.id].concat(groups[id]);
+      if (!into.a) into.a = r.a;
+      return false;
+    });
     st.byWork = {};
     st.works = order.map(function (id) {
       var m = groups[id];
@@ -2018,9 +2031,15 @@ header.scrolled { border-bottom-color: var(--sep); }
       var o = { orig: 0, ru: 1, lib: 2, bi: 3 };
       return (o[a.m] || 0) - (o[c.m] || 0) || String(a.d || "").localeCompare(String(c.d || ""));
     });
+    var labels = vers.map(function (x) { return versionLabel(x, b); });
+    labels.forEach(function (l, i) {  // одинаковые версии (книга загружена повторно) различаем по дате
+      var twins = labels.filter(function (o) { return o.main === l.main && o.sub === l.sub; }).length;
+      if (twins > 1 && vers[i].d) l.extra = "загружено " + date(vers[i].d);
+    });
+    labels.forEach(function (l) { if (l.extra) l.sub = l.sub ? l.sub + " · " + l.extra : l.extra; });
     if (vers.length > 1 || translator) {
-      html += section(vers.length > 1 ? "Доступные переводы · " + vers.length : "Перевод", '<div class="rows">' + vers.map(function (x) {
-        var l = versionLabel(x, b), cur = x.k === b.k;
+      html += section(vers.length > 1 ? "Доступные переводы · " + vers.length : "Перевод", '<div class="rows">' + vers.map(function (x, i) {
+        var l = labels[i], cur = x.k === b.k;
         var fm = String(x.f || "").split(",").filter(Boolean).map(function (f) { return '<span class="fmt">' + f.toUpperCase() + "</span>"; }).join("");
         var inner = '<span class="ic">' + (MODES[x.m] ? MODES[x.m].icon : "📘") + '</span><span class="main">' + esc(l.main) + fm +
           (l.sub ? "<small>" + esc(l.sub) + "</small>" : "") + '</span><span class="end' + (cur ? "" : " go") + '">' +
