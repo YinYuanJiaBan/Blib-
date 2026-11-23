@@ -2031,9 +2031,15 @@ header.scrolled { border-bottom-color: var(--sep); }
       var o = { orig: 0, ru: 1, lib: 2, bi: 3 };
       return (o[a.m] || 0) - (o[c.m] || 0) || String(a.d || "").localeCompare(String(c.d || ""));
     });
+    var labels = vers.map(function (x) { return versionLabel(x, b); });
+    labels.forEach(function (l, i) {  // одинаковые версии (книга загружена повторно) различаем по дате
+      var twins = labels.filter(function (o) { return o.main === l.main && o.sub === l.sub; }).length;
+      if (twins > 1 && vers[i].d) l.extra = "загружено " + date(vers[i].d);
+    });
+    labels.forEach(function (l) { if (l.extra) l.sub = l.sub ? l.sub + " · " + l.extra : l.extra; });
     if (vers.length > 1 || translator) {
-      html += section(vers.length > 1 ? "Доступные переводы · " + vers.length : "Перевод", '<div class="rows">' + vers.map(function (x) {
-        var l = versionLabel(x, b), cur = x.k === b.k;
+      html += section(vers.length > 1 ? "Доступные переводы · " + vers.length : "Перевод", '<div class="rows">' + vers.map(function (x, i) {
+        var l = labels[i], cur = x.k === b.k;
         var fm = String(x.f || "").split(",").filter(Boolean).map(function (f) { return '<span class="fmt">' + f.toUpperCase() + "</span>"; }).join("");
         var inner = '<span class="ic">' + (MODES[x.m] ? MODES[x.m].icon : "📘") + '</span><span class="main">' + esc(l.main) + fm +
           (l.sub ? "<small>" + esc(l.sub) + "</small>" : "") + '</span><span class="end' + (cur ? "" : " go") + '">' +
