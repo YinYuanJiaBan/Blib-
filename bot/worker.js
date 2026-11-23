@@ -10,6 +10,7 @@
 //   ALLOWED_USERS  — ваш Telegram ID (через запятую, если несколько) (Text)
 //   BOOKS          — KV-хранилище библиотеки готовых книг (KV binding, необязательно;
 //                    при автодеплое создаётся само)
+//   TRANSLATOR_NAME — как подписывать переводы бота (Text, необязательно; по умолчанию Blip)
 
 const HELP =
   "📚 Я собираю книги с kanunu8.com в EPUB или FB2 и перевожу их на русский.\n\n" +
@@ -44,11 +45,13 @@ const BUTTONS = {
 };
 const ICONS = { orig: "📖", ru: "🇷🇺", bi: "🔀", lib: "📗" };
 let ORIGIN = "";  // адрес воркера; задача из Actions сообщает по нему о готовой книге
+let OUR_TRANSLATOR = "Blip";  // переводчик книг, переведённых ботом (переменная TRANSLATOR_NAME)
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     ORIGIN = url.origin;
+    OUR_TRANSLATOR = String(env.TRANSLATOR_NAME || "").trim() || "Blip";
 
     // Однократная настройка: откройте /setup?key=<WEBHOOK_SECRET> в браузере.
     if (url.pathname === "/setup") {
@@ -359,7 +362,7 @@ async function onCallback(env, cq) {
       await sendSaved(env, msg.chat.id, saved, key);
       return done("Из библиотеки");
     }
-    payload.save = { url: ORIGIN + "/saved", key, sig: await sign(env, key) };
+    payload.save = { url: ORIGIN + "/saved", key, sig: await sign(env, key), src: await srcHash(source) };
   }
 
   if (action === "re" && msg.document) {
@@ -418,7 +421,7 @@ async function rebuild(env, chat_id, key) {
     return "Не знаю, откуда собирать — пришлите ссылку ещё раз";
   const st = await say(env, chat_id, `⏳ ${BUTTONS[q.mode]}: «${saved.title || saved.orig_title}» — собираю заново…`);
   const payload = { ...q, chat_id, status_id: st && st.result && st.result.message_id,
-    save: { url: ORIGIN + "/saved", key, sig: await sign(env, key) } };
+    save: { url: ORIGIN + "/saved", key, sig: await sign(env, key), src: saved.src || undefined } };
   return await dispatch(env, chat_id, payload) ? true : "Ошибка запуска";
 }
 
@@ -552,7 +555,7 @@ async function startDraft(env, msg, draft, mode) {
     await sendSaved(env, chat, saved, key);
     return true;
   }
-  payload.save = { url: ORIGIN + "/saved", key, sig: await sign(env, key) };
+  payload.save = { url: ORIGIN + "/saved", key, sig: await sign(env, key), src: await srcHash(source) };
   await tg(env, "editMessageText", { chat_id: chat, message_id: msg.message_id,
     text: `⏳ ${BUTTONS[mode]}: задача отправлена, запуск займёт до минуты…` +
       (draft.title ? `\n📝 Название: «${draft.title}»` : "") + (draft.cover ? "\n🖼 Своя обложка" : "") });
@@ -596,6 +599,14 @@ async function bookKey(mode, source, req, format) {
   const raw = JSON.stringify(parts);
   const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw)));
   return [...h.slice(0, 12)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Короткий отпечаток источника книги (ссылка или файл): версии одной книги — оригинал, перевод,
+// двуязычная — узнают друг друга по нему.
+async function srcHash(source) {
+  if (!source) return undefined;
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(source))));
+  return hex(h.slice(0, 6));
 }
 
 async function hmac(key, msg) {
@@ -668,9 +679,9 @@ async function onSaved(env, request) {
   if (!b || !/^[0-9a-f]{24}$/.test(b.key || "") || !b.file_id) return new Response("bad request", { status: 400 });
   if ((await sign(env, b.key)) !== b.sig) return new Response("forbidden", { status: 403 });
   const file_ids = (Array.isArray(b.file_ids) ? b.file_ids : []).map(String).filter(Boolean).slice(0, 50);
+  const old = await env.BOOKS.get("book:" + b.key, "json");
   if (b.alt) {  // второй формат книги — кладём рядом с основным файлом
     if (!["epub", "fb2"].includes(b.alt)) return new Response("bad request", { status: 400 });
-    const old = await env.BOOKS.get("book:" + b.key, "json");
     if (!old) return new Response("gone", { status: 404 });
     old.alt = { ...(old.alt || {}), [b.alt]: { file_id: String(b.file_id), file_ids } };
     await putBook(env, b.key, old);
@@ -684,8 +695,14 @@ async function onSaved(env, request) {
     chapters: b.chapters || 0, caption: String(b.caption || "").slice(0, 1000), date: new Date().toISOString(),
     names: (Array.isArray(b.names) ? b.names : []).map((x) => String(x).slice(0, 200)).filter(Boolean).slice(0, 12),
     req: b.request && typeof b.request === "object" ? b.request : null,
-    info: cleanInfo(b.info)
+    info: cleanInfo(b.info),
+    chars: Math.max(0, Math.round(Number(b.chars) || 0)) || undefined,
+    src: (/^[0-9a-f]{12}$/.test(b.src || "") ? b.src : "") || (old && old.src) ||
+      (b.request && b.request.url ? await srcHash(normLink(String(b.request.url))) : undefined),
+    work: old && old.work || undefined
   };
+  if ((rec.mode === "ru" || rec.mode === "bi") && !rec.info.translator) rec.info.translator = OUR_TRANSLATOR;
+  relate(rec, b.key, await listBooks(env));
   // Книгу могли собрать заново — старую обложку забываем, новая достанется из нового файла.
   await env.BOOKS.delete("cover:" + b.key);
   await putBook(env, b.key, rec);
@@ -696,7 +713,7 @@ async function onSaved(env, request) {
 function cleanInfo(x) {
   if (!x || typeof x !== "object") return {};
   const out = {};
-  for (const [k, n] of [["author", 200], ["orig_author", 200], ["genre", 200], ["synopsis", 1500],
+  for (const [k, n] of [["author", 200], ["orig_author", 200], ["translator", 200], ["genre", 200], ["synopsis", 1500],
     ["title_en", 200], ["title_literal", 200], ["title_pinyin", 200], ["title_ru", 200], ["series", 200]]) {
     const v = String(x[k] || "").trim();
     if (v && v !== "—") out[k] = v.slice(0, n);
@@ -704,14 +721,220 @@ function cleanInfo(x) {
   return out;
 }
 
-function putBook(env, key, rec) {
-  // Все варианты названия и автор — в метаданных, чтобы искать без чтения каждой записи (лимит 1024 байта).
-  const names = [...new Set([rec.title, rec.orig_title, ...rec.names].map(norm).filter(Boolean))].join("|");
-  const meta = { t: cutBytes(rec.title, 150), o: cutBytes(rec.orig_title, 80), m: rec.mode, n: rec.chapters,
-    d: rec.date, a: cutBytes((rec.info || {}).author, 70), s: "" };
+// Метаданные записи в KV: по ним строятся список, жанры, серии и переводы без чтения каждой записи (лимит 1024 байта).
+// v — версия набора полей; t, o — название и оригинальное; m — режим; n — глав; d — дата; a — автор;
+// tr — переводчик; g — жанры через |; sr, sn — серия и номер в ней; w — ключ «произведения» (другие переводы);
+// ch — знаков текста; u — отпечаток источника; f — готовые форматы; c — есть ли обложка; s — варианты названия для поиска.
+function bookMeta(rec) {
+  const info = rec.info || {};
+  const names = [...new Set([rec.title, rec.orig_title, ...(rec.names || [])].map(norm).filter(Boolean))].join("|");
+  const meta = { v: META_V, t: cutBytes(rec.title, 120), o: cutBytes(rec.orig_title, 70), m: rec.mode, n: rec.chapters,
+    d: rec.date, a: cutBytes(info.author, 90), s: "" };
+  const tr = translatorOf(rec);
+  if (tr) meta.tr = cutBytes(tr, 60);
+  if (rec.genres && rec.genres.length) {
+    let g = "";
+    for (const x of rec.genres) if (new TextEncoder().encode(g + "|" + x).length <= 100) g += (g ? "|" : "") + x;
+    if (g) meta.g = g;
+  }
+  if (rec.series && rec.series.name) {
+    meta.sr = cutBytes(rec.series.name, 70);
+    if (rec.series.n) meta.sn = rec.series.n;
+  }
+  if (rec.work) meta.w = rec.work;
+  if (rec.chars) meta.ch = rec.chars;
+  if (rec.src) meta.u = rec.src;
+  meta.f = formatsOf(rec).join(",");
   if (rec.cover !== undefined) meta.c = rec.cover;
   meta.s = cutBytes(names, 1000 - new TextEncoder().encode(JSON.stringify(meta)).length);
-  return env.BOOKS.put("book:" + key, JSON.stringify(rec), { metadata: meta });
+  return meta;
+}
+
+async function putBook(env, key, rec) {
+  const meta = bookMeta(rec);
+  await env.BOOKS.put("book:" + key, JSON.stringify(rec), { metadata: meta });
+  return meta;
+}
+
+const META_V = 2;
+const formatsOf = (rec) => [...new Set([recFormat(rec), ...Object.keys(rec.alt || {})])].filter((f) => f === "epub" || f === "fb2");
+const translatorOf = (rec) => ((rec.info || {}).translator || "") ||
+  (rec.mode === "ru" || rec.mode === "bi" ? OUR_TRANSLATOR : "");
+
+// ---------------------------------------------------------------- связи между книгами
+// Авторы пишутся единообразно: если такой автор уже был, берётся его прежнее написание.
+// «Рейчел Рид», «Рид Рейчел», «Р. Рид» — один человек.
+const nameTokens = (s) => String(s || "").toLowerCase().replace(/ё/g, "е").replace(/й/g, "\u0000").normalize("NFD")
+  .replace(/\p{M}/gu, "").replace(/\u0000/g, "й").split(/[\s.,·•\-‐_]+/u).filter(Boolean);
+const splitPeople = (s) => String(s || "").split(/\s*(?:[,;&/]|\s и\s|\sand\s)\s*/iu).map((x) => x.trim()).filter(Boolean);
+
+function sameName(a, b) {
+  const A = nameTokens(a), B = nameTokens(b);
+  if (!A.length || !B.length) return false;
+  if (A.join(" ") === B.join(" ")) return true;
+  const [sh, lo] = A.length <= B.length ? [A, B] : [B, A];
+  if (lo.length - sh.length > 1) return false;
+  const used = new Set();
+  let full = 0;
+  for (const t of sh) {
+    const i = lo.findIndex((u, j) => !used.has(j) && (u === t || (t.length === 1 && u[0] === t) || (u.length === 1 && t[0] === u)));
+    if (i < 0) return false;
+    used.add(i);
+    if (t.length > 1 && lo[i] === t) full++;
+  }
+  return full >= 1;
+}
+
+// Оба пусты — «тот же»; один пуст — «другой».
+function samePeople(a, b) {
+  const A = splitPeople(a), B = splitPeople(b);
+  if (!A.length || !B.length) return !A.length && !B.length;
+  const [sh, lo] = A.length <= B.length ? [A, B] : [B, A];
+  return sh.every((x) => lo.some((y) => sameName(x, y)));
+}
+
+function canonPeople(str, known) {
+  const out = splitPeople(str).map((p) => known.find((k) => sameName(k, p)) || p);
+  return [...new Set(out)].join(", ");
+}
+
+// Жанры: «фэнтези, сянься / уся» → ["Фэнтези", "Сянься", "Уся"]; уже встречавшийся жанр пишется по-прежнему.
+// Коды жанров FB2 (sf_fantasy и т. п.) — по-русски; неизвестные коды пропускаем, жанр потом определит модель.
+const FB2_GENRES = { sf_fantasy: "Фэнтези", sf: "Фантастика", sf_history: "Альтернативная история", sf_action: "Боевая фантастика",
+  sf_epic: "Эпическая фантастика", sf_space: "Космическая фантастика", sf_horror: "Ужасы", sf_humor: "Юмористическая фантастика",
+  sf_detective: "Детективная фантастика", love: "Любовный роман", love_contemporary: "Современный любовный роман",
+  love_history: "Исторический любовный роман", love_short: "Короткий любовный роман", love_erotica: "Эротика",
+  love_sf: "Любовное фэнтези", detective: "Детектив", det_classic: "Классический детектив", det_history: "Исторический детектив",
+  det_police: "Полицейский детектив", det_irony: "Иронический детектив", thriller: "Триллер", prose_classic: "Классическая проза",
+  prose_contemporary: "Современная проза", prose_history: "Историческая проза", foreign_prose: "Зарубежная проза",
+  adventure: "Приключения", adv_history: "Исторические приключения", child_tale: "Сказка", children: "Детская литература",
+  poetry: "Поэзия", humor: "Юмор", nonfiction: "Нон-фикшн", nonf_biography: "Биография", sci_history: "История",
+  sci_philosophy: "Философия", antique: "Старинная литература", antique_east: "Древневосточная литература" };
+
+function canonGenres(str, known) {
+  const out = [];
+  for (let g of String(str || "").split(/\s*(?:[,;/|]|\s и\s)\s*/u)) {
+    g = g.replace(/^[\s"«“]+|[\s"»”.]+$/g, "").replace(/\s+/g, " ");
+    if (/^[a-z0-9_]+$/.test(g)) g = FB2_GENRES[g] || "";
+    if (!g || g === "—" || g.length > 40) continue;
+    g = known.find((k) => norm(k) === norm(g)) || g[0].toUpperCase() + g.slice(1);
+    if (!out.some((x) => norm(x) === norm(g))) out.push(g);
+  }
+  return out.slice(0, 4);
+}
+
+// Номер тома: «Название. Книга 2», «Название (том II)», «Книга вторая: Название», «书名 第二卷», «书名（下）».
+const VOL_WORD = "(?:книга|кн\\.?|том|т\\.|часть|ч\\.|выпуск|book|bk\\.?|vol\\.?|volume|part|tome)";
+const VOL_N = "(\\d{1,3}|[ivxlc]{1,6}|перв\\S*|втор\\S*|трет\\S*|четв[её]рт\\S*|пят\\S*|шест\\S*|седьм\\S*|восьм\\S*|девят\\S*|десят\\S*" +
+  "|one|two|three|four|five|six|seven|eight|nine|ten)";
+const VOL_END = new RegExp("^(.+?)[\\s.,:;—–-]*[(\\[]?\\s*" + VOL_WORD + "\\s*" + VOL_N + "\\s*[)\\]]?\\.?$", "iu");
+const VOL_START = new RegExp("^[(\\[]?" + VOL_WORD + "\\s*" + VOL_N + "[)\\]]?\\s*[.:—–-]\\s*(.+)$", "iu");
+const VOL_HAN = /^(.+?)\s*[(（【]?\s*(?:第\s*([〇零一二两三四五六七八九十\d]+)\s*[卷部册集]|([上中下]))\s*(?:卷|册|部)?\s*[)）】]?$/u;
+const ORD = [["перв", 1], ["втор", 2], ["трет", 3], ["четв", 4], ["пят", 5], ["шест", 6], ["седьм", 7], ["восьм", 8],
+  ["девят", 9], ["десят", 10], ["one", 1], ["two", 2], ["three", 3], ["four", 4], ["five", 5], ["six", 6], ["seven", 7],
+  ["eight", 8], ["nine", 9], ["ten", 10]];
+
+function volNum(x) {
+  x = String(x || "").toLowerCase();
+  if (/^\d+$/.test(x)) return +x;
+  if (/^[ivxlc]+$/.test(x)) {
+    const R = { i: 1, v: 5, x: 10, l: 50, c: 100 };
+    let n = 0;
+    for (let i = 0; i < x.length; i++) n += R[x[i]] < (R[x[i + 1]] || 0) ? -R[x[i]] : R[x[i]];
+    return n;
+  }
+  const o = ORD.find(([k]) => x.startsWith(k));
+  if (o) return o[1];
+  const H = "〇一二三四五六七八九";
+  if (/^[〇零一二两三四五六七八九十]+$/.test(x)) {
+    const d = (c) => c === "零" ? 0 : c === "两" ? 2 : H.indexOf(c);
+    if (!x.includes("十")) return +[...x].map(d).join("");
+    const [a, b] = x.split("十");
+    return (a ? d(a) : 1) * 10 + (b ? d(b) : 0);
+  }
+  return 0;
+}
+
+function parseVolume(title) {
+  const t = String(title || "").trim();
+  let m = t.match(VOL_END);
+  if (m && volNum(m[2])) return { name: m[1].trim(), n: volNum(m[2]) };
+  m = t.match(VOL_START);
+  if (m && volNum(m[1])) return { name: m[2].trim(), n: volNum(m[1]) };
+  m = t.match(VOL_HAN);
+  if (m) {
+    const n = m[2] ? volNum(m[2]) : { 上: 1, 中: 2, 下: 3 }[m[3]];
+    if (n) return { name: m[1].trim(), n };
+  }
+  return null;
+}
+
+// Серия книги: из справки («Хоккейный роман, книга 2», «Хоккейный роман #2») или из названия («…Книга 2»).
+function seriesOf(rec) {
+  const s = String((rec.info || {}).series || "").trim();
+  if (s) {
+    const v = parseVolume(s);
+    if (v) return v;
+    const m = s.match(/^(.+?)\s*(?:[#№]\s*|,\s*|\(\s*)(\d{1,3})\s*\)?$/u);
+    if (m) return { name: m[1].trim(), n: +m[2] };
+    return { name: s, n: 0 };
+  }
+  return parseVolume(rec.title) || parseVolume(rec.orig_title) || null;
+}
+
+// Насколько могут расходиться по числу знаков переводы одной книги (разные переводчики пишут по-разному).
+const CHARS_TOLERANCE = 0.2;
+
+// Та же книга в библиотеке: тот же источник (оригинал, перевод и двуязычная из одной ссылки или файла)
+// или то же название и автор при близком числе знаков. { item, work, sameTranslator, by } или null.
+function findWork(rec, key, others) {
+  if (rec.src) {
+    const s = others.find((k) => (k.metadata || {}).u === rec.src);
+    if (s) return { item: s, work: s.metadata.w || s.name.slice(5), sameTranslator: false, by: "src" };
+  }
+  if (!rec.chars) return null;
+  const titles = [rec.title, rec.orig_title].map(norm).filter(Boolean);
+  const author = (rec.info || {}).author;
+  const tr = translatorOf(rec);
+  for (const k of others) {
+    const m = k.metadata || {};
+    if (!m.ch || k.name === "book:" + key) continue;
+    if (!titles.includes(norm(m.t)) && !(m.o && titles.includes(norm(m.o)))) continue;
+    if (m.a && author && !samePeople(m.a, author)) continue;
+    if (Math.abs(m.ch - rec.chars) > CHARS_TOLERANCE * Math.max(m.ch, rec.chars)) continue;
+    return { item: k, work: m.w || k.name.slice(5), sameTranslator: samePeople(m.tr || "", tr), by: "chars" };
+  }
+  return null;
+}
+
+// Дополняет запись связями с остальной библиотекой. items — listBooks(); возвращает findWork или null.
+// Ссылку на «произведение» (rec.work) ставит, только если переводчик другой (или это та же ссылка/файл).
+function relate(rec, key, items) {
+  const others = items.filter((k) => k.name !== "book:" + key);
+  const authors = [], translators = [], genres = [];
+  for (const k of [...others].reverse()) {  // от старых к новым: первое написание главнее
+    const m = k.metadata || {};
+    authors.push(...splitPeople(m.a));
+    translators.push(...splitPeople(m.tr));
+    genres.push(...String(m.g || "").split("|").filter(Boolean));
+  }
+  const info = rec.info = rec.info || {};
+  if (info.author) info.author = canonPeople(info.author, authors);
+  if (info.orig_author) info.orig_author = canonPeople(info.orig_author, authors);
+  if (info.translator) info.translator = canonPeople(info.translator, translators.concat(OUR_TRANSLATOR));
+  rec.genres = canonGenres(info.genre, genres);
+  rec.series = seriesOf(rec) || undefined;
+  if (rec.series) {
+    const same = others.map((k) => (k.metadata || {}).sr).find((x) => x && norm(x) === norm(rec.series.name));
+    if (same) rec.series.name = same;
+  }
+  // Ссылка жива, пока есть хоть одна книга этого произведения.
+  if (rec.work && !others.some((k) => k.name === "book:" + rec.work || (k.metadata || {}).w === rec.work)) rec.work = undefined;
+  if (rec.work === key) rec.work = undefined;
+  const match = findWork(rec, key, others);
+  const primary = others.some((k) => (k.metadata || {}).w === key);  // к этой книге уже привязаны другие
+  if (!rec.work && !primary && match && !match.sameTranslator && match.work !== key) rec.work = match.work;
+  return match;
 }
 
 async function listBooks(env) {
@@ -810,14 +1033,17 @@ async function saveUpload(env, chat, doc, replyTo, editId) {
     title: title.slice(0, 200), orig_title: "", mode: "lib", chapters: 0,
     caption: caption.slice(0, 1000), date: new Date().toISOString(), req: null,
     names: [meta.author, fileTitle, ...(meta.alt || [])].filter(Boolean).map((x) => String(x).slice(0, 200)).slice(0, 12),
-    info: cleanInfo({ author: meta.author, genre: meta.subject, synopsis: meta.description })
+    info: cleanInfo({ author: meta.author, translator: meta.translator, genre: meta.subject, synopsis: meta.description }),
+    src: await srcHash("tg:" + (doc.file_unique_id || doc.file_id))
   };
   if (meta.ok) {
     rec.cover = meta.cover ? 1 : 0;
     await putCover(env, key, meta.cover);
   }
+  relate(rec, key, await listBooks(env));
   await putBook(env, key, rec);
-  const text = `📥 Сохранено в библиотеку: «${title}»` + (meta.author ? `, ${meta.author}` : "") + sizeMb +
+  const text = `📥 Сохранено в библиотеку: «${title}»` + (rec.info.author ? `, ${rec.info.author}` : "") +
+    (rec.info.translator ? ` · перевод: ${rec.info.translator}` : "") + sizeMb +
     (meta.cover ? " · 🖼 с обложкой" : "") +
     "\nНайти потом: напишите название или автора, или /library.";
   const canDescribe = doc.file_size <= 20 * 1024 * 1024 && env.GH_TOKEN && env.GH_REPO;
@@ -851,15 +1077,39 @@ async function onInfo(env, request) {
   if (str("title")) rec.title = str("title");
   if (str("title_orig") && str("title_orig") !== rec.title) rec.orig_title = str("title_orig");
   const fresh = cleanInfo({ author: c.author, orig_author: c.author_orig, genre: c.genre, synopsis: c.synopsis,
-    series: c.series, title_ru: c.title_ru !== rec.title ? c.title_ru : "" });
+    series: c.series, translator: c.translator, title_ru: c.title_ru !== rec.title ? c.title_ru : "" });
   rec.info = { ...(rec.info || {}), ...fresh };
+  if (Number(c.chars) > 0) rec.chars = Math.round(Number(c.chars));
   // Прежние (испорченные) варианты оставляем для поиска.
   rec.names = [...new Set([oldTitle, oldAuthor, str("title_ru"), str("title_orig"), str("author"), str("author_orig"),
     ...(rec.names || [])].filter(Boolean))].slice(0, 12);
   rec.caption = (`📗 ${rec.title}` + (rec.info.author ? `\n${rec.info.author}` : "")).slice(0, 1000);
   rec.described = new Date().toISOString();
+  const match = relate(rec, b.key, await listBooks(env));
+  let note = "";
+  if (match && match.by === "chars") {
+    const other = await env.BOOKS.get(match.item.name, "json");
+    const fmt = recFormat(rec);
+    if (other && match.sameTranslator && rec.mode === "lib" && !rec.work &&
+        recFormat(other) !== fmt && !(other.alt && other.alt[fmt])) {
+      // Та же книга того же переводчика, но в другом формате — это второй формат той книги.
+      other.alt = { ...(other.alt || {}), [fmt]: { file_id: rec.file_id, file_ids: [rec.file_id] } };
+      await putBook(env, match.item.name.slice(5), other);
+      await deleteBook(env, b.key);
+      return json({ ok: true, merged: true,
+        note: `📎 Это та же книга, что «${other.title}»: файл добавлен к ней как ${fmt.toUpperCase()}.` });
+    }
+    if (other && rec.work) {
+      note = `🔗 Другой перевод книги «${other.title}»` + (translatorOf(other) ? ` (было: ${translatorOf(other)})` : "") +
+        " — в карточке книги теперь оба перевода.";
+    } else if (other && match.sameTranslator) {
+      note = `ℹ️ Похоже, эта книга уже есть в библиотеке: «${other.title}».`;
+    }
+  }
+  if (rec.series && rec.series.name) note += (note ? "\n" : "") + `📚 Серия: ${rec.series.name}` +
+    (rec.series.n ? `, книга ${rec.series.n}` : "");
   await putBook(env, b.key, rec);
-  return new Response("ok");
+  return json({ ok: true, note });
 }
 
 // Читает из EPUB (это ZIP-архив) или FB2 (.fb2.zip) название, автора, описание и обложку. Работает с файлами до 20 МБ.
@@ -885,8 +1135,30 @@ async function inspectEpub(env, file_id) {
   const titles = all("title");
   let cover = null;
   try { cover = await findCover(zip, opf, opfPath); } catch (e) { console.log("cover", e && e.stack || e); }
-  return { ok: true, title: titles[0], alt: titles.slice(1), author: all("creator").slice(0, 3).join(", "),
+  const people = opfPeople(opf);
+  return { ok: true, title: titles[0], alt: titles.slice(1), author: people.authors.slice(0, 3).join(", "),
+    translator: people.translators.slice(0, 3).join(", "),
     description: all("description")[0], subject: all("subject").slice(0, 3).join(", "), cover };
+}
+
+// Авторы и переводчики из OPF: переводчик — dc:creator/dc:contributor с ролью trl
+// (EPUB 2: opf:role="trl", EPUB 3: <meta refines="#id" property="role">trl</meta>).
+function opfPeople(opf) {
+  const roles = {};
+  for (const m of opf.matchAll(/<meta\b([^>]*)>([^<]*)<\/meta>/gi)) {
+    const a = attrsOf(m[1]);
+    if (a.property === "role" && a.refines) roles[a.refines.replace(/^#/, "")] = m[2].trim().toLowerCase();
+  }
+  const authors = [], translators = [];
+  for (const m of opf.matchAll(/<dc:(creator|contributor)\b([^>]*)>([\s\S]*?)<\/dc:\1>/gi)) {
+    const name = xmlText(m[3]);
+    if (!name || name === "—") continue;
+    const a = attrsOf(m[2]);
+    const role = String(a["opf:role"] || a.role || roles[a.id] || "").toLowerCase();
+    if (role === "trl") translators.push(name);
+    else if (m[1].toLowerCase() === "creator" && (!role || role === "aut")) authors.push(name);
+  }
+  return { authors: [...new Set(authors)], translators: [...new Set(translators)] };
 }
 
 // FB2 — это XML: метаданные в <title-info>, обложка — картинка base64 в <binary>.
@@ -899,6 +1171,9 @@ function inspectFb2(bytes) {
   const authors = [...info.matchAll(/<author\b[^>]*>([\s\S]*?)<\/author>/gi)].map((m) =>
     ["first-name", "middle-name", "last-name"].map((t) => one(t, m[1])).filter(Boolean).join(" ") || one("nickname", m[1]))
     .filter(Boolean);
+  const translators = [...info.matchAll(/<translator\b[^>]*>([\s\S]*?)<\/translator>/gi)].map((m) =>
+    ["first-name", "middle-name", "last-name"].map((t) => one(t, m[1])).filter(Boolean).join(" ") || one("nickname", m[1]))
+    .filter((x) => x && x !== "—");
   const genres = [...info.matchAll(/<genre\b[^>]*>([\s\S]*?)<\/genre>/gi)].map((m) => xmlText(m[1])).filter(Boolean);
   let cover = null;
   const img = (info.match(/<coverpage\b[^>]*>[\s\S]*?<image\b([^>]*)>/i) || [])[1];
@@ -917,6 +1192,7 @@ function inspectFb2(bytes) {
     }
   }
   return { ok: true, title: one("book-title") || undefined, alt: [], author: authors.slice(0, 3).join(", "),
+    translator: translators.slice(0, 3).join(", "),
     description: one("annotation") || undefined, subject: genres.slice(0, 3).join(", "), cover };
 }
 
@@ -1056,7 +1332,25 @@ async function onApi(env, request, url) {
 
   if (route === "books" && request.method === "GET") {
     const items = await listBooks(env);
-    return json({ token: await coverToken(env), books: items.map((k) => ({ k: k.name.slice(5), ...(k.metadata || {}) })) });
+    return json({ token: await coverToken(env), our: OUR_TRANSLATOR,
+      stale: items.filter((k) => (k.metadata || {}).v !== META_V).length,
+      books: items.map((k) => ({ k: k.name.slice(5), ...(k.metadata || {}) })) });
+  }
+  // Книги, сохранённые до жанров и серий: дописываем им метаданные (авторы, жанры, серия, переводчик).
+  if (route === "reindex" && request.method === "POST") {
+    const items = await listBooks(env);
+    const stale = [...items].reverse().filter((k) => (k.metadata || {}).v !== META_V);
+    let done = 0;
+    for (const k of stale.slice(0, 40)) {
+      const rec = await env.BOOKS.get(k.name, "json");
+      if (!rec) continue;
+      const key = k.name.slice(5);
+      if (!rec.src && rec.req && rec.req.url) rec.src = await srcHash(normLink(String(rec.req.url)));
+      relate(rec, key, items);
+      k.metadata = await putBook(env, key, rec);  // следующие книги видят уже единое написание
+      done++;
+    }
+    return json({ ok: true, done, left: Math.max(0, stale.length - done) });
   }
 
   const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
@@ -1066,8 +1360,12 @@ async function onApi(env, request, url) {
   if (!rec) return json({ error: "Этой книги больше нет в библиотеке" }, 404);
 
   if (route === "book") {
+    const own = recFormat(rec);
+    const formats = ["epub", "fb2"].map((f) => ({ f, ready: f === own || !!(rec.alt && rec.alt[f]),
+      own: f === own })).filter((x) => x.ready || (x.f === otherFormat(own) && canConvert(rec)));
     return json({ title: rec.title, orig_title: rec.orig_title, mode: rec.mode, chapters: rec.chapters, date: rec.date,
-      names: rec.names || [], info: rec.info || {}, cover: rec.cover,
+      names: rec.names || [], info: rec.info || {}, cover: rec.cover, translator: translatorOf(rec),
+      formats, chars: rec.chars || 0, series: rec.series || null, genres: rec.genres || [],
       rebuild: !!(rec.req && (rec.req.url || rec.req.file_id) && rec.mode !== "lib"),
       describe: rec.mode === "lib" && !!(env.GH_TOKEN && env.GH_REPO), described: !!rec.described,
       format: recFormat(rec), other: canConvert(rec) ? otherFormat(recFormat(rec)) : null,
@@ -1182,6 +1480,48 @@ header.scrolled { border-bottom-color: var(--sep); }
 .chips::-webkit-scrollbar { display: none; }
 .chip { flex: none; padding: 5px 12px; border-radius: 15px; background: var(--bg2); font-size: 13px; white-space: nowrap; }
 .chip.on { background: var(--accent); color: var(--accent-text); }
+.tabs { display: flex; background: var(--bg2); border-radius: 9px; padding: 2px; margin-bottom: 10px; }
+.tabs button { flex: 1; padding: 6px 0; border-radius: 7px; font-size: 14px; font-weight: 500; color: var(--hint); }
+.tabs button.on { background: var(--bg); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.crumb { display: flex; align-items: baseline; gap: 8px; padding: 12px 16px 0; }
+.crumb button { color: var(--link); font-size: 15px; white-space: nowrap; }
+.crumb b { font-size: 18px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.crumb span { color: var(--hint); font-size: 13px; white-space: nowrap; }
+
+/* ---------- папки жанров */
+.folders { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px 14px; padding: 14px 16px 40px; }
+.folder { text-align: left; min-width: 0; }
+.folder:active .fbox { transform: scale(.97); }
+.fbox { position: relative; height: 112px; margin-top: 10px; border-radius: 4px 12px 12px 12px; transition: transform .15s;
+  background: color-mix(in srgb, var(--fc) 78%, var(--bg)); box-shadow: 0 6px 16px -8px rgba(0,0,0,.45); }
+.fbox::before { content: ""; position: absolute; left: 0; top: -9px; width: 44%; height: 12px; border-radius: 6px 9px 0 0;
+  background: color-mix(in srgb, var(--fc) 78%, var(--bg)); }
+.fbox .stack { position: absolute; left: 12px; right: 12px; bottom: 10px; top: 10px; }
+.fbox .cover { position: absolute; bottom: 0; width: 44%; }
+.fbox .cover:nth-child(1) { left: 0; transform: rotate(-7deg); z-index: 1; }
+.fbox .cover:nth-child(2) { left: 28%; z-index: 3; }
+.fbox .cover:nth-child(3) { right: 0; transform: rotate(7deg); z-index: 2; }
+.fbox .front { position: absolute; left: 0; right: 0; bottom: 0; height: 46%; z-index: 4; border-radius: 0 0 12px 12px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--fc) 88%, #fff), var(--fc)); }
+.folder .t { margin-top: 8px; font-size: 14px; }
+
+/* ---------- полки в карточке: серия, другие книги автора */
+.shelf { display: flex; gap: 12px; overflow-x: auto; margin: 8px -14px 0; padding: 0 14px 4px; scrollbar-width: none; }
+.shelf::-webkit-scrollbar { display: none; }
+.mini { flex: none; width: 76px; text-align: left; }
+.mini .cover { width: 76px; }
+.mini .t { font-size: 12px; margin-top: 5px; }
+.mini .a { font-size: 11px; }
+.mini.cur .cover { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rows button, .rows .row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 9px 0; }
+.rows > * + * { border-top: 0.5px solid var(--sep); }
+.rows .ic { flex: none; width: 22px; text-align: center; }
+.rows .main { flex: 1; min-width: 0; }
+.rows .main small { display: block; color: var(--hint); font-size: 12px; }
+.rows .end { flex: none; color: var(--hint); font-size: 13px; }
+.rows .go { color: var(--link); }
+.fmt { display: inline-block; font-size: 11px; padding: 1px 5px; border-radius: 4px; margin-left: 4px;
+  border: 0.5px solid var(--sep); color: var(--hint); }
 
 /* ---------- сетка */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 20px 14px; padding: 14px 16px 40px;
@@ -1259,12 +1599,14 @@ header.scrolled { border-bottom-color: var(--sep); }
     <div><h1>Библиотека</h1><div class="count" id="count">&nbsp;</div></div>
     <button class="sort" id="sort">Сначала новые</button>
   </div>
+  <div class="tabs" id="tabs"><button data-v="books" class="on">Книги</button><button data-v="genres">Жанры</button></div>
   <label class="search">
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="7" cy="7" r="5"/><path d="m11 11 3.5 3.5"/></svg>
     <input id="q" type="search" placeholder="Название, автор, 中文, pinyin" autocomplete="off">
   </label>
   <div class="chips" id="chips"></div>
 </header>
+<div id="crumb"></div>
 <main class="grid" id="grid"></main>
 
 <section class="sheet" id="sheet" aria-hidden="true"></section>
@@ -1285,7 +1627,9 @@ header.scrolled { border-bottom-color: var(--sep); }
     lib: { icon: "📗", name: "Загружено", chip: "Загруженные" }
   };
   var COLORS = ["#2f4a6d", "#7a2f2a", "#2e5b4e", "#86642c", "#56395a", "#3d4a55", "#3a5233", "#6a4632", "#24515e", "#7b3d55"];
-  var st = { books: [], token: "", q: "", mode: "all", sort: "date", cur: null };
+  var NO_GENRE = "Без жанра";
+  var st = { books: [], works: [], byWork: {}, token: "", our: "Blip", q: "", mode: "all", sort: "date",
+    view: "books", genre: null, cur: null, stack: [] };
   var $ = function (id) { return document.getElementById(id); };
 
   function esc(s) {
@@ -1322,10 +1666,65 @@ header.scrolled { border-bottom-color: var(--sep); }
     return j;
   }
 
+  // ---------- книги, произведения, жанры, серии, авторы
+  // Произведение — одна книга во всех версиях: оригинал, переводы разных переводчиков, двуязычная.
+  // В сетке показывается одна обложка на произведение, остальные версии — в карточке.
+  function genresOf(b) { return String(b.g || "").split("|").filter(Boolean); }
+  function people(s) {
+    return String(s || "").split(/\s*(?:[,;&\/]|\sи\s|\sand\s)\s*/i).map(norm).filter(Boolean);
+  }
+  function translatorOf(b) { return b.tr || (b.m === "ru" || b.m === "bi" ? st.our : ""); }
+
+  function buildWorks() {
+    var groups = {}, order = [];
+    st.books.forEach(function (b) {
+      var id = b.w || b.k;
+      if (!groups[id]) { groups[id] = []; order.push(id); }
+      groups[id].push(b);
+    });
+    st.byWork = {};
+    st.works = order.map(function (id) {
+      var m = groups[id];
+      var rep = m.find(function (x) { return x.k === id; }) || m[0];
+      var w = { id: id, rep: rep, members: m, genres: [] };
+      m.forEach(function (x) {
+        x.work = w;
+        genresOf(x).forEach(function (g) { if (w.genres.indexOf(g) < 0) w.genres.push(g); });
+      });
+      st.byWork[id] = w;
+      return w;
+    });
+  }
+
+  function seriesKey(w) { return norm(w.rep.sr || w.rep.t || w.rep.o); }
+  function sameAuthor(a, b) {
+    var A = people(a), B = people(b);
+    if (!A.length || !B.length) return true;
+    return A.some(function (x) { return B.indexOf(x) >= 0; });
+  }
+  function seriesNum(w) { return w.rep.sn || (w.rep.sr ? 999 : 1); }
+  // Книги той же серии: общее название серии («…Книга 2» → «…»), тот же автор.
+  function seriesOf(w) {
+    var key = seriesKey(w);
+    if (!key) return null;
+    var list = st.works.filter(function (x) { return seriesKey(x) === key && sameAuthor(x.rep.a, w.rep.a); });
+    if (list.length < 2 || !list.some(function (x) { return x.rep.sr; })) return null;
+    list.sort(function (a, b) { return seriesNum(a) - seriesNum(b); });
+    var named = list.find(function (x) { return x.rep.sr; });
+    return { name: named.rep.sr, works: list };
+  }
+  function authorWorks(w) {
+    var A = people(w.rep.a);
+    if (!A.length) return [];
+    return st.works.filter(function (x) {
+      return x !== w && people(x.rep.a).some(function (p) { return A.indexOf(p) >= 0; });
+    });
+  }
+
   // ---------- обложка
   function cover(b) {
     var title = b.t || b.o || "Без названия";
-    var han = (b.o || b.t || "").match(/[㐀-鿿豈-﫿]/g);
+    var han = (b.o || b.t || "").match(/[㐀-鿿豈-﫿]/g);
     var html = '<div class="gen' + (han ? "" : " solo") + '" style="--c:' + COLORS[hash(b.o || title) % COLORS.length] + '">' +
       (han ? '<div class="slip">' + han.slice(0, 6).map(esc).join("<br>") + "</div>" : "") +
       (b.t && (!han || b.t !== b.o) ? '<div class="ru">' + esc(title) + "</div>" : "") + "</div>";
@@ -1336,15 +1735,26 @@ header.scrolled { border-bottom-color: var(--sep); }
   }
 
   // ---------- список
+  function matches(w, words) {
+    if (st.mode !== "all" && !w.members.some(function (b) { return b.m === st.mode; })) return false;
+    if (!words.length) return true;
+    return w.members.some(function (b) {
+      var hay = [b.s, norm(b.t), norm(b.o), norm(b.a), norm(b.tr), norm(b.sr), norm(b.g)].join("|");
+      return words.every(function (x) { return hay.indexOf(x) >= 0; });
+    });
+  }
+  function inGenre(w, g) {
+    return g === NO_GENRE ? !w.genres.length : w.genres.indexOf(g) >= 0;
+  }
   function visible() {
     var words = st.q.split(/\s+/).map(norm).filter(Boolean);
-    var list = st.books.filter(function (b) {
-      if (st.mode !== "all" && b.m !== st.mode) return false;
-      if (!words.length) return true;
-      var hay = [b.s, norm(b.t), norm(b.o), norm(b.a)].join("|");
-      return words.every(function (w) { return hay.indexOf(w) >= 0; });
+    var list = st.works.filter(function (w) {
+      if (st.view === "genres" && st.genre && !inGenre(w, st.genre)) return false;
+      return matches(w, words);
     });
-    if (st.sort === "title") list.sort(function (a, b) { return (a.t || a.o || "").localeCompare(b.t || b.o || "", "ru"); });
+    if (st.sort === "title") list.sort(function (a, b) {
+      return (a.rep.t || a.rep.o || "").localeCompare(b.rep.t || b.rep.o || "", "ru");
+    });
     return list;
   }
 
@@ -1352,7 +1762,7 @@ header.scrolled { border-bottom-color: var(--sep); }
     var counts = {};
     st.books.forEach(function (b) { counts[b.m] = (counts[b.m] || 0) + 1; });
     var keys = Object.keys(MODES).filter(function (m) { return counts[m]; });
-    if (keys.length < 2) { $("chips").innerHTML = ""; $("chips").style.display = "none"; return; }
+    if (keys.length < 2 || (st.view === "genres" && !st.genre)) { $("chips").innerHTML = ""; $("chips").style.display = "none"; return; }
     $("chips").style.display = "";
     $("chips").innerHTML = '<button class="chip' + (st.mode === "all" ? " on" : "") + '" data-m="all">Все</button>' +
       keys.map(function (m) {
@@ -1361,73 +1771,218 @@ header.scrolled { border-bottom-color: var(--sep); }
       }).join("");
   }
 
-  function render() {
-    var list = visible();
-    $("count").textContent = plural(st.books.length, "книга", "книги", "книг") +
-      (list.length !== st.books.length ? " · найдено " + list.length : "");
-    if (!st.books.length) {
-      $("grid").innerHTML = '<div class="msg" style="grid-column:1/-1"><b>Пока пусто</b>' +
-        "Пришлите боту ссылку на книгу или готовый EPUB, и он появится здесь.</div>";
-      return;
-    }
+  function cardHtml(w) {
+    var b = w.rep;
+    var sub = b.a || (b.o && b.o !== b.t ? b.o : "") || (b.n ? plural(b.n, "глава", "главы", "глав") : "");
+    var more = w.members.length > 1 ? " +" + (w.members.length - 1) : "";
+    return '<button class="card" data-k="' + b.k + '"><div class="cover">' +
+      '<span class="badge">' + (MODES[b.m] ? MODES[b.m].icon : "📘") + esc(more) + "</span>" + cover(b) + "</div>" +
+      '<div class="t">' + esc(b.t || b.o || "Без названия") + "</div>" +
+      '<div class="a">' + esc(sub) + "</div></button>";
+  }
+
+  function empty(title, text) {
+    return '<div class="msg" style="grid-column:1/-1"><b>' + esc(title) + "</b>" + esc(text) + "</div>";
+  }
+
+  // Папки жанров: в каждой — книги этого жанра; книга с несколькими жанрами лежит в нескольких папках.
+  function genreFolders() {
+    var words = st.q.split(/\s+/).map(norm).filter(Boolean);
+    var map = {};
+    st.works.forEach(function (w) {
+      var gs = w.genres.length ? w.genres : [NO_GENRE];
+      gs.forEach(function (g) {
+        var hit = matches(w, words) || (words.length && words.every(function (x) { return norm(g).indexOf(x) >= 0; }));
+        if (!hit) return;
+        (map[g] = map[g] || []).push(w);
+      });
+    });
+    return Object.keys(map).map(function (g) { return { name: g, works: map[g] }; }).sort(function (a, b) {
+      if ((a.name === NO_GENRE) !== (b.name === NO_GENRE)) return a.name === NO_GENRE ? 1 : -1;
+      return b.works.length - a.works.length || a.name.localeCompare(b.name, "ru");
+    });
+  }
+
+  function renderFolders() {
+    var list = genreFolders();
+    $("grid").className = "folders";
     if (!list.length) {
-      $("grid").innerHTML = '<div class="msg" style="grid-column:1/-1"><b>Ничего не нашлось</b>' +
-        "Попробуйте другое слово: подойдёт и китайское название, и пиньинь без тонов.</div>";
+      $("grid").innerHTML = empty("Ничего не нашлось", "Попробуйте другое слово: название жанра, книги или автора.");
       return;
     }
-    $("grid").innerHTML = list.map(function (b) {
-      var sub = b.a || (b.o && b.o !== b.t ? b.o : "") || (b.n ? plural(b.n, "глава", "главы", "глав") : "");
-      return '<button class="card" data-k="' + b.k + '"><div class="cover">' +
-        '<span class="badge">' + (MODES[b.m] ? MODES[b.m].icon : "📘") + "</span>" + cover(b) + "</div>" +
-        '<div class="t">' + esc(b.t || b.o || "Без названия") + "</div>" +
-        '<div class="a">' + esc(sub) + "</div></button>";
+    $("grid").innerHTML = list.map(function (f) {
+      var covers = f.works.slice(0, 3).map(function (w) { return '<div class="cover">' + cover(w.rep) + "</div>"; }).join("");
+      return '<button class="folder" data-g="' + esc(f.name) + '"><div class="fbox" style="--fc:' +
+        COLORS[hash(f.name) % COLORS.length] + '"><div class="stack">' + covers + '</div><div class="front"></div></div>' +
+        '<div class="t">' + esc(f.name) + '</div><div class="a">' + plural(f.works.length, "книга", "книги", "книг") +
+        "</div></button>";
     }).join("");
   }
 
-  async function load() {
-    $("grid").innerHTML = new Array(9).join('<div class="card skel"><div class="cover"></div><div class="t">.</div><div class="a">.</div></div>');
+  function render() {
+    var total = st.works.length;
+    $("crumb").innerHTML = "";
+    if (!st.books.length) {
+      $("count").textContent = plural(0, "книга", "книги", "книг");
+      $("grid").className = "grid";
+      $("grid").innerHTML = empty("Пока пусто", "Пришлите боту ссылку на книгу или готовый EPUB, и он появится здесь.");
+      return;
+    }
+    if (st.view === "genres" && !st.genre) {
+      var folders = genreFolders();
+      $("count").textContent = plural(total, "книга", "книги", "книг") + " · " +
+        plural(folders.filter(function (f) { return f.name !== NO_GENRE; }).length, "жанр", "жанра", "жанров");
+      renderFolders();
+      updateBack();
+      return;
+    }
+    var list = visible();
+    $("count").textContent = plural(total, "книга", "книги", "книг") +
+      (list.length !== total ? " · найдено " + list.length : "");
+    if (st.view === "genres") {
+      $("crumb").innerHTML = '<div class="crumb"><button data-back="1">‹ Жанры</button><b>' + esc(st.genre) +
+        "</b><span>" + plural(list.length, "книга", "книги", "книг") + "</span></div>";
+    }
+    $("grid").className = "grid";
+    $("grid").innerHTML = list.length ? list.map(cardHtml).join("")
+      : empty("Ничего не нашлось", "Попробуйте другое слово: подойдёт и китайское название, и пиньинь без тонов.");
+    updateBack();
+  }
+
+  function setView(v) {
+    st.view = v; st.genre = null;
+    [].forEach.call($("tabs").children, function (b) { b.classList.toggle("on", b.getAttribute("data-v") === v); });
+    $("q").placeholder = v === "genres" ? "Жанр, название, автор" : "Название, автор, 中文, pinyin";
+    renderChips(); render(); window.scrollTo(0, 0);
+  }
+
+  function updateBack() {
+    if (!(tg && INIT)) return;
+    if (st.cur || (st.view === "genres" && st.genre)) tg.BackButton.show(); else tg.BackButton.hide();
+  }
+
+  async function load(quiet) {
+    if (!quiet) $("grid").innerHTML = new Array(9).join('<div class="card skel"><div class="cover"></div><div class="t">.</div><div class="a">.</div></div>');
     if (!INIT) {
-      $("grid").innerHTML = '<div class="msg" style="grid-column:1/-1"><b>Откройте из Telegram</b>' +
-        "Библиотека работает внутри бота: кнопка «Библиотека» рядом с полем ввода.</div>";
+      $("grid").innerHTML = empty("Откройте из Telegram", "Библиотека работает внутри бота: кнопка «Библиотека» рядом с полем ввода.");
       return;
     }
     try {
       var j = await api("/api/books");
-      st.books = j.books; st.token = j.token;
-      renderChips(); render();
+      st.books = j.books; st.token = j.token; st.our = j.our || st.our;
+      buildWorks(); renderChips();
+      if (!st.cur) render();
+      // Книгам, сохранённым до жанров и серий, один раз дописываем метаданные.
+      if (j.stale && !quiet) reindex();
     } catch (e) {
-      $("grid").innerHTML = '<div class="msg" style="grid-column:1/-1"><b>Не удалось открыть</b>' + esc(e.message) + "</div>";
+      if (!quiet) $("grid").innerHTML = empty("Не удалось открыть", e.message);
     }
   }
 
+  async function reindex() {
+    try {
+      for (var i = 0; i < 10; i++) {
+        var r = await api("/api/reindex", {});
+        if (!r.done || !r.left) break;
+      }
+      await load(true);
+    } catch (e) {}
+  }
+
   // ---------- карточка книги
+  function section(title, body) { return '<div class="sec"><h3>' + esc(title) + "</h3>" + body + "</div>"; }
+
+  function miniHtml(w, label, cur) {
+    var b = w.rep;
+    return '<button class="mini card' + (cur ? " cur" : "") + '" data-k="' + b.k + '"><div class="cover">' + cover(b) + "</div>" +
+      '<div class="t">' + esc(b.t || b.o || "Без названия") + "</div>" + (label ? '<div class="a">' + esc(label) + "</div>" : "") +
+      "</button>";
+  }
+
+  function versionLabel(x, b) {
+    var tr = translatorOf(x);
+    if (x.m === "orig") return { main: "Оригинал", sub: "на языке оригинала" };
+    if (x.m === "bi") return { main: "Китайский + русский", sub: tr ? "перевод: " + tr : "" };
+    return { main: tr ? "Перевод: " + tr : (x.m === "ru" ? "Перевод" : "Переводчик не указан"),
+      sub: x.t && x.t !== b.t ? x.t : "" };
+  }
+
   function sheetHtml(b, d) {
     d = d || {};
     var info = d.info || {};
+    var w = b.work || { members: [b], rep: b, genres: genresOf(b) };
     var mode = MODES[b.m] || { icon: "📘", name: "" };
     var author = info.author || b.a || "";
     if (info.orig_author && info.orig_author !== author) author += (author ? " · " : "") + info.orig_author;
+    var translator = d.translator || translatorOf(b);
+    var genres = (d.genres && d.genres.length ? d.genres : genresOf(b));
+    if (!genres.length && info.genre) genres = [info.genre];
     var tags = [mode.icon + " " + mode.name];
     if (b.n) tags.push(plural(b.n, "глава", "главы", "глав"));
-    if (info.genre) tags.push(info.genre);
-    if (info.series) tags.push(info.series);
-    var names = [info.title_ru, info.title_literal, info.title_en, info.title_pinyin].filter(function (x) { return x && x !== b.t && x !== b.o; });
     var html = '<div class="hero"><div class="cover">' + cover(b) + "</div><div>" +
       "<h2>" + esc(b.t || b.o || "Без названия") + "</h2>" +
       (b.o && b.o !== b.t ? '<div class="orig">' + esc(b.o) + "</div>" : "") +
       (author ? '<div class="by">' + esc(author) + "</div>" : "") +
-      '<div class="tags">' + tags.map(function (t) { return '<span class="tag">' + esc(t) + "</span>"; }).join("") + "</div>" +
-      "</div></div>";
-    html += '<button class="primary" data-act="send">Прислать в чат' + (d.format ? " · " + d.format.toUpperCase() : "") + "</button>";
-    if (d.other) html += '<div class="actions"><button data-act="other">📥 Прислать в ' + d.other.toUpperCase() +
-      (d.other_ready ? "" : " (соберу за минуту)") + "</button></div>";
-    if (info.synopsis) html += '<div class="sec"><h3>О книге</h3><p>' + esc(info.synopsis) + "</p></div>";
+      (translator ? '<div class="orig" style="margin:4px 0 0;font-size:13px">Перевод: ' + esc(translator) + "</div>" : "") +
+      '<div class="tags">' + tags.map(function (t) { return '<span class="tag">' + esc(t) + "</span>"; }).join("") +
+      genres.map(function (g) { return '<button class="tag" data-genre="' + esc(g) + '">' + esc(g) + "</button>"; }).join("") +
+      "</div></div></div>";
+    var own = (d.formats || []).find(function (f) { return f.own; });
+    html += '<button class="primary" data-act="send">Прислать в чат' + (own ? " · " + own.f.toUpperCase() : "") + "</button>";
+
+    // Доступные форматы
+    if (d.formats) {
+      html += section("Доступные форматы", '<div class="rows">' + d.formats.map(function (f) {
+        return '<button data-act="fmt" data-f="' + f.f + '"><span class="ic">📄</span><span class="main">' + f.f.toUpperCase() +
+          "<small>" + (f.ready ? "готов" : "соберу примерно за минуту") + '</small></span><span class="end go">' +
+          (f.ready ? "Прислать" : "Собрать") + "</span></button>";
+      }).join("") + "</div>");
+    }
+
+    // Доступные переводы: все версии этого произведения
+    var vers = w.members.slice().sort(function (a, c) {
+      var o = { orig: 0, ru: 1, lib: 2, bi: 3 };
+      return (o[a.m] || 0) - (o[c.m] || 0) || String(a.d || "").localeCompare(String(c.d || ""));
+    });
+    if (vers.length > 1 || translator) {
+      html += section(vers.length > 1 ? "Доступные переводы · " + vers.length : "Перевод", '<div class="rows">' + vers.map(function (x) {
+        var l = versionLabel(x, b), cur = x.k === b.k;
+        var fm = String(x.f || "").split(",").filter(Boolean).map(function (f) { return '<span class="fmt">' + f.toUpperCase() + "</span>"; }).join("");
+        var inner = '<span class="ic">' + (MODES[x.m] ? MODES[x.m].icon : "📘") + '</span><span class="main">' + esc(l.main) + fm +
+          (l.sub ? "<small>" + esc(l.sub) + "</small>" : "") + '</span><span class="end' + (cur ? "" : " go") + '">' +
+          (cur ? "✓ открыт" : "Открыть") + "</span>";
+        return cur ? '<div class="row">' + inner + "</div>" : '<button data-open="' + x.k + '">' + inner + "</button>";
+      }).join("") + "</div>");
+    }
+
+    if (info.synopsis) html += section("О книге", "<p>" + esc(info.synopsis) + "</p>");
     else if (!d.info) html += '<div class="sec skel"><h3>О книге</h3><div class="t">.</div><div class="a">.</div></div>';
-    else if (d.describe) html += '<div class="sec"><h3>О книге</h3><p style="color:var(--hint)">Описания пока нет. ' +
-      "Нажмите «Составить описание» ниже: бот прочитает начало книги и определит название, автора и жанр.</p></div>";
+    else if (d.describe) html += section("О книге", '<p style="color:var(--hint)">Описания пока нет. ' +
+      "Нажмите «Составить описание» ниже: бот прочитает начало книги и определит название, автора, переводчика и жанр.</p>");
+
+    // Серия
+    var ser = b.work && seriesOf(b.work);
+    if (ser) {
+      html += section("Серия · " + ser.name, '<div class="shelf">' + ser.works.map(function (x) {
+        var n = x.rep.sn || (x.rep.sr ? 0 : 1);
+        return miniHtml(x, n ? "Книга " + n : "", x === b.work);
+      }).join("") + "</div>");
+    }
+    // Ещё у автора (кроме книг этой серии)
+    var more = b.work ? authorWorks(b.work).filter(function (x) { return !ser || ser.works.indexOf(x) < 0; }) : [];
+    if (more.length) {
+      html += section("Ещё у автора · " + more.length, '<div class="shelf">' + more.map(function (x) {
+        return miniHtml(x, x.rep.sr ? x.rep.sr + (x.rep.sn ? ", кн. " + x.rep.sn : "") : "", false);
+      }).join("") + "</div>");
+    }
+
+    var names = [info.title_ru, info.title_literal, info.title_en, info.title_pinyin].filter(function (x) { return x && x !== b.t && x !== b.o; });
     if (names.length) html += '<div class="sec names"><h3>Другие названия</h3>' +
       names.map(function (n) { return "<div>" + esc(n) + "</div>"; }).join("") + "</div>";
-    if (b.d) html += '<div class="sec"><h3>В библиотеке</h3><p>с ' + esc(date(b.d)) + "</p></div>";
+    var about = [];
+    if (b.d) about.push("с " + date(b.d));
+    if (d.chars) about.push("≈ " + Math.round(d.chars / 1000) + " тыс. знаков");
+    if (about.length) html += section("В библиотеке", "<p>" + esc(about.join(" · ")) + "</p>");
     html += '<div class="actions">' + (d.rebuild ? '<button data-act="edit">✏️ Название и обложка</button>' +
       '<button data-act="rebuild">🔄 Собрать заново</button>' : "") +
       (d.describe ? '<button data-act="describe">📝 ' + (d.described ? "Составить описание заново" : "Составить описание") + "</button>" : "") +
@@ -1435,45 +1990,61 @@ header.scrolled { border-bottom-color: var(--sep); }
     return html;
   }
 
-  async function openBook(k) {
+  // push — открыть из другой карточки: «Назад» вернёт к ней.
+  async function openBook(k, push) {
     var b = st.books.find(function (x) { return x.k === k; });
     if (!b) return;
     haptic();
+    if (push && st.cur && st.cur !== b) st.stack.push(st.cur.k);
+    if (!push) st.stack = [];
     st.cur = b;
     st.detail = null;
     var sh = $("sheet");
     sh.innerHTML = sheetHtml(b); sh.scrollTop = 0;
     sh.classList.add("open"); sh.setAttribute("aria-hidden", "false");
-    if (tg && INIT) {
-      tg.BackButton.show();
-      tg.MainButton.setParams({ text: "Прислать в чат", is_visible: true, is_active: true });
-    }
+    if (tg && INIT) tg.MainButton.setParams({ text: "Прислать в чат", is_visible: true, is_active: true });
+    updateBack();
     try {
       var d = await api("/api/book?k=" + k);
       if (d.cover !== undefined) b.c = d.cover;
       if (d.info && d.info.author && !b.a) b.a = d.info.author;
-      st.detail = d;
-      if (st.cur === b) sh.innerHTML = sheetHtml(b, d);
+      if (st.cur === b) { st.detail = d; sh.innerHTML = sheetHtml(b, d); }
     } catch (e) {
       if (st.cur === b) { sh.innerHTML = sheetHtml(b, { info: {} }); toast(e.message); }
     }
   }
 
-  // Подтянуть свежие данные книги (после описания меняются название и автор).
+  // Подтянуть свежие данные книги (после описания меняются название, автор, жанр).
   async function refresh(b) {
-    try {
-      var j = await api("/api/books");
-      st.books = j.books;
-      var nb = st.books.find(function (x) { return x.k === b.k; });
-      if (nb && st.cur === b) openBook(nb.k);
-    } catch (e) {}
+    await load(true);
+    var nb = st.books.find(function (x) { return x.k === b.k; });
+    if (nb && st.cur && st.cur.k === b.k) { st.cur = null; openBook(nb.k); }
   }
 
   function closeBook() {
-    st.cur = null;
+    st.cur = null; st.stack = [];
     $("sheet").classList.remove("open"); $("sheet").setAttribute("aria-hidden", "true");
-    if (tg && INIT) { tg.BackButton.hide(); tg.MainButton.hide(); }
+    if (tg && INIT) tg.MainButton.hide();
     render();
+  }
+
+  function goBack() {
+    if (st.cur) {
+      var prev = st.stack.pop();
+      if (prev && st.books.some(function (x) { return x.k === prev; })) {
+        var keep = st.stack; openBook(prev, false); st.stack = keep;
+      } else closeBook();
+      return;
+    }
+    if (st.view === "genres" && st.genre) { st.genre = null; renderChips(); render(); window.scrollTo(0, 0); }
+  }
+
+  function openGenre(g) {
+    if (st.cur) { st.cur = null; st.stack = []; $("sheet").classList.remove("open"); if (tg && INIT) tg.MainButton.hide(); }
+    st.view = "genres";
+    [].forEach.call($("tabs").children, function (x) { x.classList.toggle("on", x.getAttribute("data-v") === "genres"); });
+    st.genre = g; st.q = ""; $("q").value = "";
+    haptic(); renderChips(); render(); window.scrollTo(0, 0);
   }
 
   function confirmAsk(text) {
@@ -1482,7 +2053,7 @@ header.scrolled { border-bottom-color: var(--sep); }
     });
   }
 
-  async function act(what) {
+  async function act(what, el) {
     var b = st.cur;
     if (!b) return;
     if (what === "send") {
@@ -1494,13 +2065,12 @@ header.scrolled { border-bottom-color: var(--sep); }
         if (tg && INIT && tg.isVersionAtLeast && !tg.isVersionAtLeast("6.0")) tg.close();
       } catch (e) { toast(e.message); }
       if (tg && INIT) tg.MainButton.hideProgress();
-    } else if (what === "other") {
-      var d = st.detail || {};
-      if (!d.other) return;
+    } else if (what === "fmt") {
+      var f = el.getAttribute("data-f");
       try {
-        var r = await api("/api/other", { k: b.k, f: d.other });
+        var r = await api("/api/other", { k: b.k, f: f });
         haptic("medium");
-        toast(r.started ? "Собираю " + d.other.toUpperCase() + " — файл придёт в чат" : "Файл отправлен в чат с ботом");
+        toast(r.started ? "Собираю " + f.toUpperCase() + " — файл придёт в чат" : "Файл отправлен в чат с ботом");
         if (r.started) setTimeout(function () { if (st.cur === b) refresh(b); }, 90000);
       } catch (e) { toast(e.message); }
     } else if (what === "rebuild") {
@@ -1521,17 +2091,25 @@ header.scrolled { border-bottom-color: var(--sep); }
       try {
         await api("/api/delete", { k: b.k });
         st.books = st.books.filter(function (x) { return x !== b; });
-        renderChips(); closeBook(); toast("Книга убрана из библиотеки");
+        buildWorks(); renderChips(); closeBook(); toast("Книга убрана из библиотеки");
       } catch (e) { toast(e.message); }
     }
   }
 
   // ---------- события
   $("grid").addEventListener("click", function (e) {
-    var c = e.target.closest(".card[data-k]"); if (c) openBook(c.getAttribute("data-k"));
+    var c = e.target.closest(".card[data-k]"); if (c) return openBook(c.getAttribute("data-k"));
+    var f = e.target.closest(".folder[data-g]"); if (f) openGenre(f.getAttribute("data-g"));
+  });
+  $("crumb").addEventListener("click", function (e) { if (e.target.closest("[data-back]")) goBack(); });
+  $("tabs").addEventListener("click", function (e) {
+    var t = e.target.closest("[data-v]"); if (t) { haptic(); setView(t.getAttribute("data-v")); }
   });
   $("sheet").addEventListener("click", function (e) {
-    var a = e.target.closest("[data-act]"); if (a) act(a.getAttribute("data-act"));
+    var o = e.target.closest("[data-open]"); if (o) return openBook(o.getAttribute("data-open"), true);
+    var c = e.target.closest(".card[data-k]"); if (c) return openBook(c.getAttribute("data-k"), true);
+    var g = e.target.closest("[data-genre]"); if (g) return openGenre(g.getAttribute("data-genre"));
+    var a = e.target.closest("[data-act]"); if (a) act(a.getAttribute("data-act"), a);
   });
   $("chips").addEventListener("click", function (e) {
     var c = e.target.closest(".chip"); if (!c) return;
@@ -1546,10 +2124,10 @@ header.scrolled { border-bottom-color: var(--sep); }
   $("q").addEventListener("keydown", function (e) { if (e.key === "Enter") this.blur(); });
   window.addEventListener("scroll", function () { $("head").classList.toggle("scrolled", window.scrollY > 4); }, { passive: true });
   if (tg && INIT) {
-    tg.BackButton.onClick(closeBook);
+    tg.BackButton.onClick(goBack);
     tg.MainButton.onClick(function () { act("send"); });
   }
-  document.addEventListener("keydown", function (e) { if (e.key === "Escape" && st.cur) closeBook(); });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") goBack(); });
   load();
 })();
 </script>

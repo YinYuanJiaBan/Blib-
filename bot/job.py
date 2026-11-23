@@ -90,6 +90,10 @@ def send_document(path, filename, caption, thumb=None):
         return json.loads(r.read())
 
 
+# Так подписываются книги, которые перевёл бот (переменная репозитория TRANSLATOR_NAME).
+OUR_TRANSLATOR = os.environ.get("TRANSLATOR_NAME") or "Blip"
+
+
 def save_to_library(file_id, **info):
     """Сообщает воркеру о готовом файле: при повторном запросе бот отдаст его сразу."""
     save = P.get("save") or {}
@@ -97,7 +101,8 @@ def save_to_library(file_id, **info):
         return False
     if ALT:  # второй формат: воркер добавит файлы к уже сохранённой книге
         info = {"file_ids": info.get("file_ids"), "alt": ALT}
-    body = json.dumps({"key": save["key"], "sig": save.get("sig", ""), "file_id": file_id, **info}).encode()
+    body = json.dumps({"key": save["key"], "sig": save.get("sig", ""), "src": save.get("src", ""),
+                       "file_id": file_id, **info}).encode()
     req = urllib.request.Request(save["url"], data=body, headers={"Content-Type": "application/json",
                                                                  "User-Agent": "book-epub-bot"})
     try:
@@ -197,14 +202,21 @@ def user_cover(edit):
 
 
 def post_json(url, body):
+    """POST в воркер. Ответ воркера (dict) или None при ошибке."""
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "User-Agent": "book-epub-bot"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status == 200
+            if r.status != 200:
+                return None
+            try:
+                answer = json.loads(r.read() or b"{}")
+            except ValueError:
+                answer = {}
+            return answer if isinstance(answer, dict) else {}
     except Exception as e:  # noqa: BLE001
         print(f"Библиотека: {getattr(e, 'code', '')} {type(e).__name__}", file=sys.stderr)
-        return False
+        return None
 
 
 def describe():
@@ -221,7 +233,7 @@ def describe():
         return done("📝 Описание не составлено: не задан ключ OpenRouter.")
     tmp = tempfile.mkdtemp()
     try:
-        book = load_upload(tmp, limit=8)
+        book = load_upload(tmp)  # целиком: по числу знаков узнаётся та же книга в другом переводе
     except Exception as e:  # noqa: BLE001 — нет текста, битый файл и т. п.
         print(f"EPUB: {type(e).__name__}: {e}", file=sys.stderr)
         return done("📝 Описание не составлено: не получилось прочитать текст книги.")
@@ -234,12 +246,17 @@ def describe():
     print("OpenRouter:", usage.summary(), file=sys.stderr)
     if not card:
         return done("📝 Описание не составлено: модель не ответила, попробуйте позже из библиотеки.")
+    # Переводчик — из самого файла, если он там указан, иначе — что нашла модель.
+    card["translator"] = book.get("translator") or card.get("translator") or ""
+    card["chars"] = b2e.text_chars(book)
     ok = post_json(dest["url"], {"key": dest.get("key"), "sig": dest.get("sig"), "card": card})
-    if not ok:
+    if ok is None:
         return done("📝 Описание составлено, но бот не смог его сохранить.")
     who = card.get("author") or card.get("author_orig")
     done(f"📝 «{card.get('title') or book['title']}»" + (f", {who}" if who else "") +
-         (f" · {card['genre']}" if card.get("genre") else "") + " — описание добавлено в библиотеку.")
+         (f" · {card['genre']}" if card.get("genre") else "") +
+         (f" · перевод: {card['translator']}" if card.get("translator") else "") +
+         " — описание добавлено в библиотеку." + ("\n" + ok["note"] if ok.get("note") else ""))
 
 
 def convert():
@@ -381,6 +398,8 @@ def main():
 
     if title:
         book["orig_title"], book["title"] = orig_title, title
+    if mode in ("ru", "bi"):
+        book["translator"] = OUR_TRANSLATOR
     fmt = P.get("format") or edit.get("format") or ("fb2" if b2e.is_fb2(P.get("file_name")) else "epub")
     fmt = fmt if fmt in ("epub", "fb2") else "epub"
     status(f"📦 Собираю {fmt.upper()}…", force=True)
@@ -450,10 +469,12 @@ def main():
         info = {"author": c.get("author_ru") or book.get("author") or head.get("author"),
                 "orig_author": book.get("orig_author") or head.get("author"), "genre": c.get("genre"),
                 "synopsis": c.get("synopsis"), "title_en": c.get("title_en"),
-                "title_literal": c.get("title_literal"), "title_pinyin": c.get("title_pinyin")}
+                "title_literal": c.get("title_literal"), "title_pinyin": c.get("title_pinyin"),
+                "translator": book.get("translator") or (head.get("translator") if mode == "orig" else "")}
         saved = save_to_library(file_ids[0], file_ids=file_ids, title=book["title"], orig_title=orig_title,
                                 mode=mode, chapters=n, caption=lib_caption[:1000], names=[x for x in names if x],
-                                request=request, info={k: v for k, v in info.items() if v}, format=fmt)
+                                request=request, info={k: v for k, v in info.items() if v}, format=fmt,
+                                chars=b2e.text_chars(book))
     status("✅ Готово" + (" — с замечаниями, см. подпись к файлу" if not complete else "")
            + (" · 📚 сохранено в библиотеке" if saved else ""), force=True)
 

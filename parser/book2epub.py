@@ -269,10 +269,29 @@ def load_from_epub(path, limit=None):
         chapters = chapters[:limit]
     if not chapters:
         raise ValueError("В EPUB не нашлось текста.")
-    author = meta("creator")
+    author, translator = _epub_people(opf)
     return {"title": meta("title") or os.path.splitext(os.path.basename(path))[0],
-            "author": "" if author == "—" else author, "description": description,
+            "author": author, "translator": translator, "description": description,
             "chapters": chapters, "source": os.path.basename(path), "failed": [], "cover": cover}
+
+
+def _epub_people(opf):
+    """Автор и переводчик из OPF. Переводчик — dc:creator/dc:contributor с ролью trl
+    (EPUB 2: opf:role="trl", EPUB 3: <meta refines="#id" property="role">trl</meta>)."""
+    roles = {m.group(1): m.group(2).strip().lower() for m in re.finditer(
+        r'<meta\b[^>]*refines="#([^"]+)"[^>]*property="role"[^>]*>([^<]*)</meta>', opf)}
+    authors, translators = [], []
+    for m in re.finditer(r"<dc:(creator|contributor)\b([^>]*)>(.*?)</dc:\1>", opf, re.S):
+        name = _xml_text(m.group(3))
+        if not name or name == "—":
+            continue
+        attrs = dict(re.findall(r'([\w:-]+)="([^"]*)"', m.group(2)))
+        role = (attrs.get("opf:role") or attrs.get("role") or roles.get(attrs.get("id", ""), "")).lower()
+        if role == "trl":
+            translators.append(name)
+        elif m.group(1) == "creator" and role in ("", "aut"):
+            authors.append(name)
+    return ", ".join(dict.fromkeys(authors[:3])), ", ".join(dict.fromkeys(translators[:3]))
 
 
 IMAGE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
@@ -391,7 +410,7 @@ def load_from_fb2(path, limit=None):
     ns = root.tag[:root.tag.index("}") + 1] if root.tag.startswith("{") else ""
 
     info = root.find(f"{ns}description/{ns}title-info")
-    title, author, description = "", "", []
+    title, author, description, translators = "", "", [], []
     if info is not None:
         el = info.find(f"{ns}book-title")
         title = _fb2_text(el) if el is not None else ""
@@ -405,6 +424,13 @@ def load_from_fb2(path, limit=None):
         ann = info.find(f"{ns}annotation")
         if ann is not None:
             description = _fb2_paras(ann)
+        for t in info.findall(f"{ns}translator"):
+            names = [_fb2_text(x) for tag in ("first-name", "middle-name", "last-name") for x in t.findall(f"{ns}{tag}")]
+            name = " ".join(x for x in names if x)
+            if not name and t.find(f"{ns}nickname") is not None:
+                name = _fb2_text(t.find(f"{ns}nickname"))
+            if name and name != "—":
+                translators.append(name)
     cover = None
     img = info.find(f"{ns}coverpage/{ns}image") if info is not None else None
     if img is not None:
@@ -446,8 +472,13 @@ def load_from_fb2(path, limit=None):
     if not chapters:
         raise ValueError("В FB2 не нашлось текста.")
     return {"title": title or re.sub(r"\.fb2(\.zip)?$", "", os.path.basename(path), flags=re.I),
-            "author": author, "description": description,
+            "author": author, "translator": ", ".join(dict.fromkeys(translators[:3])), "description": description,
             "chapters": chapters, "source": os.path.basename(path), "failed": [], "cover": cover}
+
+
+def text_chars(book):
+    """Сколько в книге знаков текста (без пробелов) — чтобы узнать ту же книгу в другом переводе."""
+    return sum(len(re.sub(r"\s+", "", p)) for ch in book.get("chapters", []) for p in ch.get("paras", []))
 
 
 def is_fb2(name):
@@ -909,12 +940,14 @@ DESCRIBE_PROMPT = """Ты библиограф. По метаданным фай
   "title_orig": "название оригинала, если это перевод, иначе пустая строка",
   "author": "автор так, как он указан в этом издании, на языке текста",
   "author_orig": "имя автора в оригинале, если это перевод, иначе пустая строка",
+  "translator": "переводчик этого издания, если он указан в книге (титул, копирайт), иначе пустая строка",
   "series": "серия и номер книги в ней, если есть, иначе пустая строка",
   "genre": "жанр по-русски, коротко",
   "synopsis": "о чём книга, 3–6 предложений по-русски, без спойлеров финала"
 }"""
 
-DESCRIBE_FIELDS = ("title", "title_ru", "title_orig", "author", "author_orig", "series", "genre", "synopsis")
+DESCRIBE_FIELDS = ("title", "title_ru", "title_orig", "author", "author_orig", "translator", "series", "genre",
+                   "synopsis")
 
 
 def describe_book(book, api_key, model=DEFAULT_MODEL, usage=None):
@@ -1290,6 +1323,9 @@ def build_epub(path, book, lang):
     extra_meta = "".join(
         f"<dc:{tag}>{esc(value)}</dc:{tag}>\n" for tag, value in
         (("description", card.get("synopsis")), ("subject", card.get("genre"))) if value)
+    if book.get("translator"):
+        extra_meta += (f'<dc:contributor id="trl">{esc(book["translator"])}</dc:contributor>\n'
+                       '<meta refines="#trl" property="role" scheme="marc:relators">trl</meta>\n')
     if cover:
         extra_meta += '<meta name="cover" content="cover-img"/>\n'
 
@@ -1408,6 +1444,8 @@ def build_fb2(path, book, lang):
     title_info.append(f"<lang>{lang}</lang>")
     if lang != "zh":
         title_info.append("<src-lang>zh</src-lang>")
+    for name in [x.strip() for x in (book.get("translator") or "").split(",") if x.strip()]:
+        title_info.append(person(name, "translator"))
     src_info = ""
     if book.get("orig_title") or book.get("orig_author"):
         src_info = ("<src-title-info><genre>prose_classic</genre>" + person(book.get("orig_author") or book["author"])

@@ -39,6 +39,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          TRANSLATOR_NAME: ${{ vars.TRANSLATOR_NAME }}
           # Необязательно: лимит расходов на одну книгу в долларах и провайдер OpenRouter (например, DeepSeek).
           TRANSLATE_BUDGET_USD: ${{ vars.TRANSLATE_BUDGET_USD }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
